@@ -29,7 +29,6 @@ only touches a page while you have the extension loaded and toggled on.
 - **Crop** — in the save modal, drag a region of the captured image and **Apply** to crop; **Reset crop** restores the original capture.
 - **Save as / Download / Copy** — native save dialog, one-click timestamped download, or PNG to the clipboard.
 - **Persistence** — settings, recent colors, the spotlight selection, and whether the toolbar is open are remembered across reloads. The toolbar always re-opens in **read** mode, never straight into Select (see [Persistence](#persistence)).
-- **Works anywhere** — runs on any `http`/`https` page, in any environment (prod / staging / dev).
 
 ## Browser compatibility
 
