@@ -1,6 +1,10 @@
 <img src="icons/icon-128.png" alt="Nshot logo" width="128" height="128" />
 
-# Nshot
+# Nshot - Screenshot Tool
+
+<a href="https://drive.google.com/file/d/1hkXG29Z5PswaRmePoxRNvnV4wQ8j8Bxs/view" target="_blank" rel="noopener noreferrer"><img src="images/demo.png" alt="Nshot demo" /></a>
+
+▶ <a href="https://drive.google.com/file/d/1hkXG29Z5PswaRmePoxRNvnV4wQ8j8Bxs/view" target="_blank" rel="noopener noreferrer">Watch the demo</a>
 
 **Nshot** is a Chromium extension for composing screenshots of any page —
 in any environment (prod / staging / dev). It shows a control toolbar **above**
@@ -13,12 +17,6 @@ It runs as a Chrome extension because that is the only way to read and
 manipulate a page's real DOM/CSS while bypassing strict CSPs (content scripts
 run in a privileged context). Nothing is injected into any app bundle — Nshot
 only touches a page while you have the extension loaded and toggled on.
-
-## Demo
-
-[![Nshot demo](images/demo.png)](https://drive.google.com/file/d/1hkXG29Z5PswaRmePoxRNvnV4wQ8j8Bxs/view)
-
-▶ [Watch the demo](https://drive.google.com/file/d/1hkXG29Z5PswaRmePoxRNvnV4wQ8j8Bxs/view)
 
 ## Features
 
