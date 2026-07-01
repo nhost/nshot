@@ -58,12 +58,6 @@ Then in Chrome:
 After pulling changes, re-run `pnpm build` and hit the reload icon on the
 extension card. Use `pnpm watch` to rebuild on save (then reload the card).
 
-## Prototype the UI fast (no extension reload)
-
-Most of the tool is plain DOM/CSS in a ShadowRoot — only capture and download
-touch Chrome APIs. To iterate on the toolbar/modal look without
-rebuilding and reloading the unpacked extension:
-
 ## Usage
 
 Press **Ctrl/Cmd+Shift+S** (or click the extension's toolbar icon) to toggle the
@@ -186,6 +180,12 @@ state below in one go (the persisted slider settings stay put).
     the tool restores, resolution retries as the DOM settles (up to ~5s, and
     without clobbering the stored set) so late-rendered targets aren't lost.
     Elements that still don't exist after that window are skipped on restore.
+
+## Prototype the UI fast (no extension reload)
+
+Most of the tool is plain DOM/CSS in a ShadowRoot — only capture and download
+touch Chrome APIs. To iterate on the toolbar/modal look without
+rebuilding and reloading the unpacked extension:
 
 ```bash
 pnpm dev      # serves dev/harness.html with esbuild live-reload
