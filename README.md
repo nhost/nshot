@@ -116,8 +116,8 @@ element (a plain click) moves the live edits to it.
 
 Each slider snaps to a few discrete stops while dragging, but you can **click its
 numeric readout to type a custom value** within the slider's allowed range
-(Padding 0–100, Line thickness 1–100, Border radius 0–100, Background dim
-0–100%). **Enter** commits the typed value; **Esc** cancels the edit.
+(Padding 0–99, Line thickness 1–99, Border radius 0–99, Background dim
+0–99%). **Enter** commits the typed value; **Esc** cancels the edit.
 
 **Hotkey** opens `chrome://extensions/shortcuts` so you can rebind or clear
 the toggle shortcut. **Reset** returns the four sliders to their defaults and
