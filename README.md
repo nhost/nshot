@@ -14,6 +14,12 @@ manipulate a page's real DOM/CSS while bypassing strict CSPs (content scripts
 run in a privileged context). Nothing is injected into any app bundle — Nshot
 only touches a page while you have the extension loaded and toggled on.
 
+## Demo
+
+[![Nshot demo](images/demo.png)](https://drive.google.com/file/d/1hkXG29Z5PswaRmePoxRNvnV4wQ8j8Bxs/view)
+
+▶ [Watch the demo](https://drive.google.com/file/d/1hkXG29Z5PswaRmePoxRNvnV4wQ8j8Bxs/view)
+
 ## Features
 
 - **Toggle hotkey** — **Ctrl/Cmd+Shift+S** (or click the extension's toolbar icon) shows/hides the tool on the current tab. It is a browser-global command handled by the service worker, so it works on any tab without opening the tool first. Rebind or disable it at `chrome://extensions/shortcuts`; the **Hotkey** button in the settings popover opens that page directly.
