@@ -6,8 +6,7 @@
 
 ▶ <a href="https://drive.google.com/file/d/1hkXG29Z5PswaRmePoxRNvnV4wQ8j8Bxs/view" target="_blank" rel="noopener noreferrer">Watch the demo</a>
 
-**Nshot** is a Chromium extension for composing screenshots of any page —
-in any environment (prod / staging / dev). It shows a control toolbar **above**
+**Nshot** is a Chromium extension for composing screenshots of any page. It shows a control toolbar **above**
 the page (it pushes the page down rather than overlaying it) where you can
 **dim** the background, **spotlight** (cut out) chosen elements, and draw an
 accent **outline**, then capture the visible viewport and **crop**, **save**,
@@ -47,7 +46,6 @@ This extension is built using the standard Chrome Extensions API and can be side
 ## Build & install (load unpacked)
 
 ```bash
-cd tools/screenshot-extension
 pnpm install --ignore-workspace   # standalone; not part of the pnpm workspace
 pnpm build                        # bundles src/ -> dist/
 ```
@@ -66,40 +64,6 @@ extension card. Use `pnpm watch` to rebuild on save (then reload the card).
 Most of the tool is plain DOM/CSS in a ShadowRoot — only capture and download
 touch Chrome APIs. To iterate on the toolbar/modal look without
 rebuilding and reloading the unpacked extension:
-
-```bash
-pnpm dev      # serves dev/harness.html with esbuild live-reload
-```
-
-Open `http://localhost:5500/harness.html`. It mounts the **real** toolbar with
-the Chrome calls stubbed (capture returns a placeholder image; download/save-as
-trigger a normal browser download). Editing `src/content/*.ts` reloads the page
-instantly.
-
-This can't exercise the real `captureVisibleTab` or the native save dialog, so
-still load the unpacked extension to verify the actual capture/save flow.
-
-The real extension deliberately **skips** the harness pages (`harness.html` and
-`harness2.html`) — via the manifest `exclude_matches` and a matching guard in the
-background worker — so its content script never stacks a second toolbar on top of
-the harness-mounted one, even with the extension loaded and the dev server open.
-
-## Icon
-
-The icon is a single source SVG (`icons/icon.svg`) baked into the PNG sizes the
-manifest needs. Requires Google Chrome / Chromium (renderer) and ImageMagick
-(downscale); set `CHROME=/path/to/chrome` if it isn't auto-found.
-
-```bash
-pnpm icons         # bake icon-{16,32,48,128}.png + a preview.png contact sheet
-pnpm icons:watch   # rebake on every icon.svg save + live-reload a preview page
-```
-
-`pnpm icons:watch` serves `http://localhost:5510/` showing the **real** baked
-PNGs at true size on light/dark and in a mock browser toolbar; editing
-`icons/icon.svg` rebakes and repaints automatically. The PNGs are committed and
-copied into `dist/` by `pnpm build` — re-run `pnpm icons` (then `pnpm build`)
-after changing the SVG. `icons/preview.png` is generated and git-ignored.
 
 ## Usage
 
@@ -223,6 +187,23 @@ state below in one go (the persisted slider settings stay put).
     the tool restores, resolution retries as the DOM settles (up to ~5s, and
     without clobbering the stored set) so late-rendered targets aren't lost.
     Elements that still don't exist after that window are skipped on restore.
+
+```bash
+pnpm dev      # serves dev/harness.html with esbuild live-reload
+```
+
+Open `http://localhost:5500/harness.html`. It mounts the **real** toolbar with
+the Chrome calls stubbed (capture returns a placeholder image; download/save-as
+trigger a normal browser download). Editing `src/content/*.ts` reloads the page
+instantly.
+
+This can't exercise the real `captureVisibleTab` or the native save dialog, so
+still load the unpacked extension to verify the actual capture/save flow.
+
+The real extension deliberately **skips** the harness pages (`harness.html` and
+`harness2.html`) — via the manifest `exclude_matches` and a matching guard in the
+background worker — so its content script never stacks a second toolbar on top of
+the harness-mounted one, even with the extension loaded and the dev server open.
 
 ## Layout
 
