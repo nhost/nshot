@@ -1,0 +1,2007 @@
+import {
+  copyBlobToClipboard,
+  dataUrlToBlob,
+  nextRepaint,
+  requestCapture,
+  requestDownload,
+  requestOpenShortcuts,
+} from './capture.ts';
+import {
+  DEFAULT_OPTIONS,
+  OverlayController,
+  type SelectionEntry,
+} from './overlay.ts';
+import { FRAME_STYLES } from './styles.ts';
+
+// Persist the chosen outline color so it survives page reloads and
+// navigations. Stored in localStorage (page-origin scoped) and validated as a
+// hex color on read, since the page shares that storage and could tamper with
+// the value before it reaches `style.background` / the overlay.
+const OUTLINE_COLOR_KEY = 'nhost-ss:outline-color';
+const HEX_COLOR = /^#[0-9a-f]{3,8}$/i;
+
+function loadOutlineColor(): string | null {
+  try {
+    const value = localStorage.getItem(OUTLINE_COLOR_KEY);
+    return value && HEX_COLOR.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveOutlineColor(color: string): void {
+  try {
+    localStorage.setItem(OUTLINE_COLOR_KEY, color);
+  } catch {
+    // Storage can be unavailable (privacy mode, sandboxed frames); the color
+    // just won't persist there.
+  }
+}
+
+// Recently-used outline colors (most recent first), shown as quick-pick swatches
+// in the color popover. Persisted and validated as hex on read like the current
+// color, since the page shares this storage.
+const RECENT_COLORS_KEY = 'nhost-ss:recent-colors';
+const MAX_RECENT_COLORS = 4;
+// Transparent (no outline) is a permanent first swatch, never part of history.
+// Stored as 8-digit hex so it passes HEX_COLOR validation on persist/read.
+const TRANSPARENT_COLOR = '#00000000';
+// White seeds the color history by default (droppable as new colors are picked).
+const WHITE_COLOR = '#ffffff';
+
+function loadRecentColors(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_COLORS_KEY);
+    const arr: unknown = raw ? JSON.parse(raw) : null;
+    if (!Array.isArray(arr)) {
+      return [];
+    }
+    return arr
+      .filter((c): c is string => typeof c === 'string' && HEX_COLOR.test(c))
+      .map((c) => c.toLowerCase());
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentColors(colors: string[]): void {
+  try {
+    localStorage.setItem(RECENT_COLORS_KEY, JSON.stringify(colors));
+  } catch {
+    // Best-effort; storage may be unavailable.
+  }
+}
+
+// Spotlight effect settings adjustable from the settings popover, each snapping
+// to a few discrete stops (px). Persisted in localStorage (per-origin, so they
+// survive across sessions) and validated against their stops on read, since the
+// page shares that storage. All of them are per-pick: they seed the next picked
+// element; already-spotlit elements keep the values they were picked with.
+// Padding stops for the settings slider; 0 means no padding (off).
+const PADDING_VALUES = [0, 2, 4, 6, 8, 10, 12] as const;
+const THICKNESS_STOPS = [1, 2, 3, 4, 5] as const;
+const RADIUS_STOPS = [0, 4, 8, 12, 16, 24] as const;
+// Background dim strength (0 = none, 1 = fully black). Default 0.6 sits mid-row.
+const DIM_STOPS = [0.3, 0.4, 0.5, 0.6, 0.7] as const;
+// Padding the Reset button restores.
+const PADDING_DEFAULT_ON = 0;
+
+const PADDING_KEY = 'nhost-ss:padding';
+const THICKNESS_KEY = 'nhost-ss:thickness';
+const RADIUS_KEY = 'nhost-ss:radius';
+const DIM_KEY = 'nhost-ss:dim';
+
+// Whether the toolbar is open. Stored in sessionStorage (per-tab) so a full
+// page reload re-opens it where it was, without leaking the open state to other
+// tabs or surviving the tab being closed.
+const ACTIVE_KEY = 'nhost-ss:active';
+
+function loadActive(): boolean {
+  try {
+    return sessionStorage.getItem(ACTIVE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function saveActive(on: boolean): void {
+  try {
+    if (on) {
+      sessionStorage.setItem(ACTIVE_KEY, 'true');
+    } else {
+      sessionStorage.removeItem(ACTIVE_KEY);
+    }
+  } catch {
+    // Best-effort; storage may be unavailable.
+  }
+}
+
+function loadSetting(key: string, min: number, max: number): number | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null) {
+      return null;
+    }
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= min && value <= max
+      ? value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveSetting(key: string, value: number): void {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    // Best-effort; storage may be unavailable.
+  }
+}
+
+// Persist the spotlight selection (and the undo history) per-page so they
+// survive reloads and round-trip navigations (click a link, then come back).
+// Each picked element is stored as a robust CSS path plus the color/padding
+// chosen for it, in sessionStorage (per-tab, cleared when the tab closes), and
+// re-resolved on the next activation.
+// Keyed by pathname so each page keeps its own spotlight set. These must be
+// evaluated per call (not frozen at module load): in a single-page app the
+// content script loads once but the path changes on client-side navigation.
+const selectionKey = (path: string = location.pathname): string =>
+  `nhost-ss:selection:${path}`;
+const historyKey = (path: string = location.pathname): string =>
+  `nhost-ss:history:${path}`;
+
+// Build a reasonably stable, unique selector for an element: an id shortcut
+// when one resolves uniquely, otherwise an :nth-of-type path up to <html> or
+// the nearest uniquely-id'd ancestor.
+function uniqueSelector(el: Element): string | null {
+  if (
+    el.id &&
+    document.querySelectorAll(`#${CSS.escape(el.id)}`).length === 1
+  ) {
+    return `#${CSS.escape(el.id)}`;
+  }
+  const path: string[] = [];
+  let node: Element | null = el;
+  while (node && node !== document.documentElement) {
+    const parent: Element | null = node.parentElement;
+    if (!parent) {
+      break;
+    }
+    const tag = node.localName;
+    const sameTag = Array.from(parent.children).filter(
+      (c) => c.localName === tag,
+    );
+    path.unshift(
+      sameTag.length > 1
+        ? `${tag}:nth-of-type(${sameTag.indexOf(node) + 1})`
+        : tag,
+    );
+    if (
+      parent.id &&
+      document.querySelectorAll(`#${CSS.escape(parent.id)}`).length === 1
+    ) {
+      path.unshift(`#${CSS.escape(parent.id)}`);
+      return path.join(' > ');
+    }
+    node = parent;
+  }
+  return path.length ? path.join(' > ') : null;
+}
+
+interface StoredSelection {
+  s: string;
+  c: string;
+  p: number;
+  w: number;
+  r: number;
+}
+
+function toStored(entries: SelectionEntry[]): StoredSelection[] {
+  return entries
+    .map((e): StoredSelection | null => {
+      const s = uniqueSelector(e.el);
+      return s
+        ? { s, c: e.color, p: e.padding, w: e.outlineWidth, r: e.radius }
+        : null;
+    })
+    .filter((x): x is StoredSelection => x !== null);
+}
+
+// Resolve a parsed array of stored entries back to live elements, dropping any
+// whose selector no longer parses or resolves on this page.
+function resolveStored(items: unknown): SelectionEntry[] {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+  const entries: SelectionEntry[] = [];
+  for (const item of items) {
+    if (typeof item !== 'object' || item === null) {
+      continue;
+    }
+    const { s, c, p, w, r } = item as Record<string, unknown>;
+    if (typeof s !== 'string') {
+      continue;
+    }
+    const color =
+      typeof c === 'string' && HEX_COLOR.test(c)
+        ? c.toLowerCase()
+        : DEFAULT_OPTIONS.outlineColor;
+    const padding =
+      typeof p === 'number' && Number.isFinite(p) ? p : DEFAULT_OPTIONS.padding;
+    const outlineWidth =
+      typeof w === 'number' && Number.isFinite(w)
+        ? w
+        : DEFAULT_OPTIONS.outlineWidth;
+    const radius =
+      typeof r === 'number' && Number.isFinite(r) ? r : DEFAULT_OPTIONS.radius;
+    try {
+      const el = document.querySelector(s);
+      if (el) {
+        entries.push({ el, color, padding, outlineWidth, radius });
+      }
+    } catch {
+      // Ignore selectors that no longer parse or resolve on this page.
+    }
+  }
+  return entries;
+}
+
+function saveSelection(entries: SelectionEntry[], path?: string): void {
+  try {
+    const items = toStored(entries);
+    if (items.length) {
+      sessionStorage.setItem(selectionKey(path), JSON.stringify(items));
+    } else {
+      sessionStorage.removeItem(selectionKey(path));
+    }
+  } catch {
+    // Best-effort; storage may be unavailable.
+  }
+}
+
+function loadSelection(path?: string): SelectionEntry[] {
+  try {
+    const raw = sessionStorage.getItem(selectionKey(path));
+    return resolveStored(raw ? JSON.parse(raw) : null);
+  } catch {
+    return [];
+  }
+}
+
+// The undo history is an array of selection snapshots (oldest first), each
+// stored exactly like a selection so it can be re-resolved after navigation.
+function saveHistory(history: SelectionEntry[][], path?: string): void {
+  try {
+    if (history.length) {
+      sessionStorage.setItem(
+        historyKey(path),
+        JSON.stringify(history.map(toStored)),
+      );
+    } else {
+      sessionStorage.removeItem(historyKey(path));
+    }
+  } catch {
+    // Best-effort; storage may be unavailable.
+  }
+}
+
+function loadHistory(path?: string): SelectionEntry[][] {
+  try {
+    const raw = sessionStorage.getItem(historyKey(path));
+    const snapshots: unknown = raw ? JSON.parse(raw) : null;
+    if (!Array.isArray(snapshots)) {
+      return [];
+    }
+    return snapshots.map((snap) => resolveStored(snap));
+  } catch {
+    return [];
+  }
+}
+
+// The raw stored array (before resolving selectors to live elements). Used to
+// count how many picks were persisted, so the resilient restore knows when
+// every one has resolved and it can stop retrying.
+function readStored(key: string): unknown[] {
+  try {
+    const raw = sessionStorage.getItem(key);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+const ICONS = {
+  camera:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z"/><circle cx="12" cy="13" r="3"/></svg>',
+  close:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>',
+  save: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>',
+  download:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  undo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5 5.5 5.5 0 0 1-5.5 5.5H11"/></svg>',
+  expand:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
+  crop: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>',
+  check:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+};
+
+// Toolbar height in px. The toolbar is fixed at the top and the document is
+// pushed down by exactly this much while the tool is active, so the bar sits
+// above the page rather than over it.
+const TOOLBAR_HEIGHT = 44;
+
+/** Flat download name with a timestamp, e.g. `screenshot-2026-06-28-143022.png`.
+ * No nested folders — downloads land directly in the browser's download dir. */
+function downloadFilename(): string {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const ts =
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  return `screenshot-${ts}.png`;
+}
+
+// Icons are static, trusted markup. Parsing them as SVG (rather than assigning
+// innerHTML) keeps the build free of any HTML-injection surface.
+function svgEl(markup: string): SVGElement {
+  const frag = document.createRange().createContextualFragment(markup.trim());
+  return frag.firstElementChild as SVGElement;
+}
+
+function makeBtn(
+  text: string,
+  opts: { icon?: string; className?: string; title?: string } = {},
+): HTMLButtonElement {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = `nhost-ss-btn ${opts.className ?? ''}`.trim();
+  if (opts.title) {
+    el.title = opts.title;
+  }
+  if (opts.icon) {
+    el.appendChild(svgEl(opts.icon));
+  }
+  const span = document.createElement('span');
+  span.textContent = text;
+  el.appendChild(span);
+  return el;
+}
+
+function iconBtn(
+  icon: string,
+  className: string,
+  title: string,
+): HTMLButtonElement {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = className;
+  el.title = title;
+  el.appendChild(svgEl(icon));
+  return el;
+}
+
+export interface Toolbar {
+  toggle(): void;
+  activate(): void;
+  deactivate(): void;
+  readonly active: boolean;
+}
+
+export function createToolbar(): Toolbar {
+  const overlay = new OverlayController();
+  const opts = { ...DEFAULT_OPTIONS };
+  const storedColor = loadOutlineColor();
+  if (storedColor) {
+    opts.outlineColor = storedColor;
+  }
+  const storedPadding = loadSetting(PADDING_KEY, 0, 100);
+  if (storedPadding !== null) {
+    opts.padding = storedPadding;
+  }
+  const storedThickness = loadSetting(THICKNESS_KEY, 1, 100);
+  if (storedThickness !== null) {
+    opts.outlineWidth = storedThickness;
+  }
+  const storedRadius = loadSetting(RADIUS_KEY, 0, 100);
+  if (storedRadius !== null) {
+    opts.radius = storedRadius;
+  }
+  const storedDim = loadSetting(DIM_KEY, 0, 1);
+  if (storedDim !== null) {
+    opts.dim = storedDim;
+  }
+  let active = false;
+
+  // The frame lives in its own ShadowRoot so the page's CSS can neither style
+  // it nor be styled by it. The host carries the no-capture attribute, so
+  // clicks on it are never treated as element picks.
+  const host = document.createElement('div');
+  host.dataset.nhostScreenshotFrame = '';
+  host.setAttribute('data-nhost-ss-nocapture', '');
+  const shadow = host.attachShadow({ mode: 'open' });
+
+  const style = document.createElement('style');
+  style.textContent = FRAME_STYLES;
+
+  const frame = document.createElement('div');
+  frame.className = 'nhost-ss-frame';
+
+  // --- Selection island ---
+  // The outline-color swatch sits in Select's icon slot (just left of it) but
+  // is its own click target, so Select toggles picking and the swatch opens the
+  // color picker. Select has no icon of its own.
+  const selectBtn = makeBtn('Select', {
+    className: 'nhost-ss-select',
+    title: 'Toggle select mode',
+  });
+  // Undo: icon-only. Lives in the collapsible left group (only shown in select
+  // mode), between Settings and Select. Only usable while picking.
+  const undoBtn = iconBtn(ICONS.undo, 'nhost-ss-btn nhost-ss-undo', 'Undo');
+  undoBtn.disabled = true;
+  const clearBtn = makeBtn('Clear', {
+    className: 'nhost-ss-clear',
+    title: 'Clear the spotlight selection',
+  });
+  // Starts empty, so nothing to clear yet; syncClear re-enables on selection.
+  clearBtn.disabled = true;
+
+  // Outline color: a single swatch in the toolbar that opens a small popover
+  // with two options — the current color, and a custom color picker.
+  const outlineSwatch = document.createElement('span');
+  outlineSwatch.className = 'nhost-ss-outline-swatch';
+  {
+    const t = opts.outlineColor.toLowerCase() === TRANSPARENT_COLOR;
+    outlineSwatch.classList.toggle('is-transparent', t);
+    // Clear the inline background when transparent so the white .is-transparent
+    // rule wins; otherwise the swatch shows the dark toolbar through it.
+    outlineSwatch.style.background = t ? '' : opts.outlineColor;
+  }
+  const outlineBtn = document.createElement('button');
+  outlineBtn.type = 'button';
+  outlineBtn.className = 'nhost-ss-btn nhost-ss-outline-btn';
+  outlineBtn.title = 'Color & settings';
+  outlineBtn.appendChild(outlineSwatch);
+
+  // A single floating, draggable popover opened from the color swatch: a header
+  // (drag handle + close) on top, then the color row, then the settings.
+  const colorPop = document.createElement('div');
+  colorPop.className = 'nhost-ss-color-pop';
+  const colorPopHead = document.createElement('div');
+  colorPopHead.className = 'nhost-ss-pop-head';
+  const colorPopTitle = document.createElement('span');
+  colorPopTitle.className = 'nhost-ss-pop-title';
+  colorPopTitle.textContent = 'Color & settings';
+  const colorPopClose = iconBtn(ICONS.close, 'nhost-ss-pop-close', 'Close');
+  colorPopHead.append(colorPopTitle, colorPopClose);
+  const colorRow = document.createElement('div');
+  colorRow.className = 'nhost-ss-color-row';
+  colorPop.append(colorPopHead, colorRow);
+
+  let colorPopOpen = false;
+  // Remembered popover position. null means "the default spot under the swatch";
+  // dragging updates it, and only the X button resets it back to null. Esc and
+  // Select keep it, so the popover reopens where you left it.
+  let popPos: { left: number; top: number } | null = null;
+  // Whether the popover was open at the moment select mode was last left, so
+  // re-entering select mode can bring it back (or leave it closed) to match.
+  let popWantOpen = false;
+  // Assigned with the reset button below; keeps it disabled when every setting
+  // (color, padding, thickness, radius, dim) is already at its default.
+  let syncReset: () => void = () => {};
+  // Assigned below; reverts the custom swatch out of its "confirm" state.
+  let resetCustomPick: () => void = () => {};
+  // Hide the popover without forgetting where it is or that it was open.
+  const closeColorPop = () => {
+    colorPopOpen = false;
+    colorPop.classList.remove('is-open');
+    resetCustomPick();
+  };
+  const openColorPop = () => {
+    // First open falls back to the default spot under the button and remembers
+    // it; later opens (and select-mode re-entry) reuse the remembered/dragged
+    // spot. Clamp into the viewport in case it shrank since.
+    if (!popPos) {
+      const r = outlineBtn.getBoundingClientRect();
+      popPos = { left: r.left, top: r.bottom + 13 };
+    }
+    const maxLeft = Math.max(0, window.innerWidth - colorPop.offsetWidth);
+    const maxTop = Math.max(
+      TOOLBAR_HEIGHT,
+      window.innerHeight - colorPop.offsetHeight,
+    );
+    colorPop.style.left = `${Math.min(Math.max(0, popPos.left), maxLeft)}px`;
+    colorPop.style.top = `${Math.min(Math.max(TOOLBAR_HEIGHT, popPos.top), maxTop)}px`;
+    renderColorPop();
+    colorPopOpen = true;
+    colorPop.classList.add('is-open');
+  };
+
+  // Drag the popover by any non-interactive part of it — the header, the
+  // padding around its edges, the setting labels, or the gaps between controls
+  // — so it can be repositioned by grabbing its sides/edges, not just the
+  // header. Buttons, inputs, sliders and the clickable value readouts are
+  // exempt so they keep working.
+  {
+    const NON_DRAG = 'button, input, .nhost-ss-set-val';
+    let dragging = false;
+    let dx = 0;
+    let dy = 0;
+    colorPop.addEventListener('pointerdown', (e) => {
+      if ((e.target as Element).closest(NON_DRAG)) {
+        return;
+      }
+      dragging = true;
+      const r = colorPop.getBoundingClientRect();
+      dx = e.clientX - r.left;
+      dy = e.clientY - r.top;
+      // Stop the press from selecting label text or shifting focus.
+      e.preventDefault();
+      colorPop.setPointerCapture(e.pointerId);
+      colorPop.classList.add('is-dragging');
+    });
+    colorPop.addEventListener('pointermove', (e) => {
+      if (!dragging) {
+        return;
+      }
+      const left = Math.min(
+        Math.max(0, e.clientX - dx),
+        Math.max(0, window.innerWidth - colorPop.offsetWidth),
+      );
+      // Never let it rise above the toolbar; keep it below the header.
+      const top = Math.min(
+        Math.max(TOOLBAR_HEIGHT, e.clientY - dy),
+        Math.max(TOOLBAR_HEIGHT, window.innerHeight - colorPop.offsetHeight),
+      );
+      colorPop.style.left = `${left}px`;
+      colorPop.style.top = `${top}px`;
+      // Remember the dragged spot so it reopens here next time (until reset).
+      popPos = { left, top };
+    });
+    const endDrag = (e: PointerEvent) => {
+      if (!dragging) {
+        return;
+      }
+      dragging = false;
+      colorPop.releasePointerCapture(e.pointerId);
+      colorPop.classList.remove('is-dragging');
+    };
+    colorPop.addEventListener('pointerup', endDrag);
+    colorPop.addEventListener('pointercancel', endDrag);
+  }
+  colorPopClose.addEventListener('click', () => {
+    // The X button is the only thing that resets the popover to its default
+    // position; every other close keeps the remembered spot.
+    popPos = null;
+    closeColorPop();
+  });
+
+  // Transparent is a permanent first swatch (rendered separately), so history
+  // holds only real colors. Seed it with white when empty, and make sure the
+  // current (non-transparent) color is represented so its swatch shows active.
+  const storedRecents = loadRecentColors().filter(
+    (c) => c !== TRANSPARENT_COLOR,
+  );
+  let recentColors = (
+    storedRecents.length ? storedRecents : [WHITE_COLOR]
+  ).slice(0, MAX_RECENT_COLORS);
+  {
+    const cur = opts.outlineColor.toLowerCase();
+    if (cur !== TRANSPARENT_COLOR && !recentColors.includes(cur)) {
+      recentColors = [cur, ...recentColors].slice(0, MAX_RECENT_COLORS);
+    }
+  }
+
+  const applyColor = (color: string, persist: boolean) => {
+    opts.outlineColor = color;
+    const isTransparent = color.toLowerCase() === TRANSPARENT_COLOR;
+    outlineSwatch.classList.toggle('is-transparent', isTransparent);
+    outlineSwatch.style.background = isTransparent ? '' : color;
+    overlay.setOptions({ outlineColor: color });
+    // Live-apply to whatever is currently selected, then seed the next pick.
+    overlay.applyToActive({ color });
+    if (persist) {
+      saveOutlineColor(color);
+    }
+  };
+
+  // The custom picker (rainbow swatch) opens the browser's native color dialog.
+  // 'input' previews the color live; the pick is committed only when confirmed
+  // (the swatch's checkmark, or the native dialog's own commit on modal OSes).
+  const colorInput = document.createElement('input');
+  colorInput.type = 'color';
+  colorInput.className = 'nhost-ss-color-input';
+  colorInput.value =
+    opts.outlineColor.toLowerCase() !== TRANSPARENT_COLOR
+      ? opts.outlineColor
+      : (recentColors[0] ?? WHITE_COLOR);
+  const customBtn = document.createElement('button');
+  customBtn.type = 'button';
+  customBtn.className = 'nhost-ss-swatch nhost-ss-swatch--custom';
+  customBtn.title = 'Custom color';
+  // The native color input is overlaid full-size on the button (CSS inset:0),
+  // so a click lands on it directly and opens the native picker.
+  customBtn.appendChild(colorInput);
+  // Shown only while picking: the swatch morphs into a confirm (checkmark)
+  // button that locks the color in and adds it to the history.
+  const customCheck = document.createElement('span');
+  customCheck.className = 'nhost-ss-swatch-check';
+  customCheck.appendChild(svgEl(ICONS.check));
+  customBtn.appendChild(customCheck);
+
+  // While the native picker is open the swatch acts as a confirm button. A flag
+  // (not the bubbled input click) distinguishes the two: opening clicks target
+  // the overlaid input; once we disable its pointer events, confirm clicks land
+  // on the button itself.
+  let customPicking = false;
+  // Whether this custom-picker session has already recorded an undo snapshot.
+  // Reset when a new pick starts so the whole drag collapses to one Undo step.
+  let customEditSnapshotted = false;
+  const beginCustomPick = (): void => {
+    if (customPicking) {
+      return;
+    }
+    customPicking = true;
+    customEditSnapshotted = false;
+    customBtn.classList.add('is-confirming');
+    customBtn.title = 'Confirm color';
+    customBtn.style.background = colorInput.value;
+    colorInput.style.pointerEvents = 'none';
+  };
+  resetCustomPick = (): void => {
+    if (!customPicking) {
+      return;
+    }
+    customPicking = false;
+    customBtn.classList.remove('is-confirming');
+    customBtn.title = 'Custom color';
+    customBtn.style.background = '';
+    colorInput.style.pointerEvents = '';
+  };
+  const confirmCustomPick = (): void => {
+    if (!customPicking) {
+      return;
+    }
+    resetCustomPick();
+    // Best-effort dismissal of the native picker (the OS panel may linger on
+    // some platforms, but the color is committed regardless).
+    colorInput.blur();
+    commitColor(colorInput.value);
+    renderColorPop();
+  };
+
+  function commitColor(color: string): void {
+    const norm = color.toLowerCase();
+    // Transparent is the permanent pin; it never joins the history row.
+    if (norm !== TRANSPARENT_COLOR) {
+      recentColors = [norm, ...recentColors.filter((c) => c !== norm)].slice(
+        0,
+        MAX_RECENT_COLORS,
+      );
+      saveRecentColors(recentColors);
+    }
+    applyColor(norm, true);
+    syncReset();
+    syncClearHistory();
+  }
+  // Reflect the current color onto the existing swatches without rebuilding the
+  // row. Rebuilding mid-click would detach the clicked element, and the
+  // toolbar's outside-click dismiss would then treat it as a click outside the
+  // popover and close it.
+  function setActiveSwatch(): void {
+    const current = opts.outlineColor.toLowerCase();
+    for (const el of colorRow.children) {
+      if (el instanceof HTMLElement && el.dataset.color !== undefined) {
+        el.classList.toggle('is-active', el.dataset.color === current);
+      }
+    }
+  }
+  function renderColorPop(): void {
+    colorRow.replaceChildren();
+    const current = opts.outlineColor.toLowerCase();
+    const makeSwatch = (color: string, transparent: boolean) => {
+      const sw = document.createElement('button');
+      sw.type = 'button';
+      sw.className = 'nhost-ss-swatch';
+      sw.dataset.color = color;
+      if (transparent) {
+        sw.classList.add('nhost-ss-swatch--transparent');
+        sw.title = 'No outline';
+      } else {
+        sw.style.background = color;
+        sw.title = color;
+      }
+      if (current === color) {
+        sw.classList.add('is-active');
+      }
+      // Selecting applies immediately and leaves the popover open; it closes
+      // only via the header X, the toolbar color button, or Esc.
+      sw.addEventListener('click', () => {
+        overlay.snapshotForUndo();
+        applyColor(color, true);
+        syncReset();
+        syncClearHistory();
+        setActiveSwatch();
+      });
+      return sw;
+    };
+    // Fixed layout: transparent first, a constant number of history slots
+    // (empty ones shown as placeholders so the row never changes width), then
+    // the custom picker last.
+    colorRow.appendChild(makeSwatch(TRANSPARENT_COLOR, true));
+    for (let i = 0; i < MAX_RECENT_COLORS; i++) {
+      const color = recentColors[i];
+      if (color) {
+        colorRow.appendChild(makeSwatch(color, false));
+      } else {
+        const empty = document.createElement('span');
+        empty.className = 'nhost-ss-swatch nhost-ss-swatch--empty';
+        colorRow.appendChild(empty);
+      }
+    }
+    colorRow.append(customBtn);
+  }
+
+  colorInput.addEventListener('click', beginCustomPick);
+  colorInput.addEventListener('input', () => {
+    // Record one snapshot at the start of the drag; the live previews that
+    // follow mutate the active selection in place without piling up steps.
+    if (!customEditSnapshotted) {
+      overlay.snapshotForUndo();
+      customEditSnapshotted = true;
+    }
+    applyColor(colorInput.value, false);
+    // Preview the picked color on the swatch, behind the checkmark.
+    customBtn.style.background = colorInput.value;
+  });
+  // On modal platforms the popover can't be clicked while the native dialog is
+  // open, so the dialog's own commit ('change') confirms the pick too.
+  colorInput.addEventListener('change', confirmCustomPick);
+  // In confirm mode the input's pointer events are off, so this click lands on
+  // the button; opening clicks target the input and are ignored here.
+  customBtn.addEventListener('click', (e) => {
+    if (e.target === colorInput) {
+      return;
+    }
+    confirmCustomPick();
+  });
+
+  outlineBtn.addEventListener('click', () => {
+    if (colorPopOpen) {
+      closeColorPop();
+    } else {
+      openColorPop();
+    }
+  });
+
+  // Padding is set entirely from the settings slider below (0 = no padding). It
+  // persists and seeds the next pick; already-spotlit elements keep their own.
+  const setPadding = (value: number) => {
+    opts.padding = value;
+    overlay.setOptions({ padding: value });
+    overlay.applyToActive({ padding: value });
+    saveSetting(PADDING_KEY, value);
+    syncReset();
+  };
+
+  // --- Settings (sliders appended into the shared color popover below) ---
+
+  // A labelled slider that snaps to a few discrete stops. Returns the row plus
+  // a `sync` that reflects an externally-set value (e.g. padding toggled by its
+  // button) back onto the slider + readout. `onChange` fires the chosen stop.
+  // `snapshot` (when given) records one undo step per interaction: once at the
+  // start of a drag and once per typed commit, so a whole drag collapses into a
+  // single Undo rather than one per stop crossed.
+  const buildSlider = (
+    label: string,
+    stops: readonly number[],
+    current: number,
+    format: (v: number) => string,
+    onChange: (v: number) => void,
+    edit: { min: number; max: number; toRaw?: (n: number) => number },
+    snapshot?: () => void,
+  ): { row: HTMLElement; sync: (v: number) => void } => {
+    const row = document.createElement('div');
+    row.className = 'nhost-ss-set-row';
+
+    const name = document.createElement('span');
+    name.className = 'nhost-ss-set-label';
+    name.textContent = label;
+    const valueEl = document.createElement('span');
+    valueEl.className = 'nhost-ss-set-val';
+    valueEl.title = 'Click to type an exact value';
+    const valueInput = document.createElement('input');
+    valueInput.type = 'text';
+    valueInput.inputMode = 'numeric';
+    valueInput.maxLength = 2;
+    valueInput.className = 'nhost-ss-set-val-input';
+
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.className = 'nhost-ss-slider';
+    slider.min = '0';
+    slider.max = String(stops.length - 1);
+    // 'any' lets the thumb glide continuously; the value snaps to the nearest
+    // stop (Math.round below), so it only changes once the thumb passes the
+    // midpoint toward the next notch.
+    slider.step = 'any';
+
+    const nearestIndex = (v: number): number => {
+      let idx = 0;
+      for (let i = 1; i < stops.length; i++) {
+        const a = stops[i];
+        const b = stops[idx];
+        if (
+          a !== undefined &&
+          b !== undefined &&
+          Math.abs(a - v) < Math.abs(b - v)
+        ) {
+          idx = i;
+        }
+      }
+      return idx;
+    };
+    // Position the thumb proportionally for an arbitrary (typed) value; pins to
+    // an end when the value falls outside the discrete stop range.
+    const fractionalIndex = (v: number): number => {
+      const first = stops[0] ?? 0;
+      const last = stops[stops.length - 1] ?? 0;
+      if (v <= first) {
+        return 0;
+      }
+      if (v >= last) {
+        return stops.length - 1;
+      }
+      for (let i = 0; i < stops.length - 1; i++) {
+        const a = stops[i];
+        const b = stops[i + 1];
+        if (a !== undefined && b !== undefined && b !== a && v >= a && v <= b) {
+          return i + (v - a) / (b - a);
+        }
+      }
+      return stops.length - 1;
+    };
+    let lastIdx = nearestIndex(current);
+    // True once a drag/keyboard adjustment has taken its single undo snapshot,
+    // so subsequent stops in the same interaction don't each record a step.
+    let editing = false;
+    const sync = (v: number): void => {
+      const idx = nearestIndex(v);
+      lastIdx = idx;
+      slider.value = String(idx);
+      valueEl.textContent = format(stops[idx] ?? v);
+    };
+    sync(current);
+
+    slider.addEventListener('input', () => {
+      const idx = Math.round(Number(slider.value));
+      const value = stops[idx] ?? stops[0] ?? 0;
+      valueEl.textContent = format(value);
+      if (idx !== lastIdx) {
+        // Snapshot the pre-drag state on the first stop crossed, then let the
+        // rest of the drag preview live without stacking more undo steps.
+        if (!editing) {
+          editing = true;
+          snapshot?.();
+        }
+        lastIdx = idx;
+        onChange(value);
+      }
+    });
+    // Snap the thumb to its notch once the drag ends, so it never rests between
+    // stops while keeping the drag itself smooth. Ending the pointer/keyboard
+    // interaction also closes the current undo step, so the next drag records a
+    // fresh one.
+    slider.addEventListener('change', () => {
+      slider.value = String(lastIdx);
+      editing = false;
+    });
+    const endInteraction = (): void => {
+      editing = false;
+    };
+    slider.addEventListener('pointerup', endInteraction);
+    slider.addEventListener('pointercancel', endInteraction);
+
+    // The readout doubles as an exact-value editor: click to type a number
+    // (clamped to [min, max]). The thumb glides to roughly the matching spot,
+    // but the next slider touch snaps back to the discrete stops.
+    const toRaw = edit.toRaw ?? ((n: number): number => n);
+    const openEditor = (): void => {
+      valueInput.value = valueEl.textContent ?? '';
+      valueEl.style.display = 'none';
+      valueInput.style.display = 'inline-block';
+      valueInput.focus();
+      valueInput.select();
+    };
+    const closeEditor = (): void => {
+      valueInput.style.display = 'none';
+      valueEl.style.display = '';
+    };
+    const commitEditor = (): void => {
+      // Enter closes the editor and then blur fires a second commit; ignore it
+      // so a manual entry records exactly one undo step.
+      if (valueInput.style.display === 'none') {
+        return;
+      }
+      const typed = Number(valueInput.value);
+      if (Number.isFinite(typed) && valueInput.value.trim() !== '') {
+        const clamped = Math.min(edit.max, Math.max(edit.min, typed));
+        const raw = toRaw(clamped);
+        snapshot?.();
+        valueEl.textContent = format(raw);
+        slider.value = String(fractionalIndex(raw));
+        // Force the next slider input to register as a change so dragging
+        // re-snaps to a discrete stop value.
+        lastIdx = -1;
+        onChange(raw);
+      }
+      closeEditor();
+    };
+    valueEl.addEventListener('click', openEditor);
+    // Digits only, at most two — strip anything else as it is typed/pasted.
+    valueInput.addEventListener('input', () => {
+      const digits = valueInput.value.replace(/[^0-9]/g, '').slice(0, 2);
+      if (digits !== valueInput.value) {
+        valueInput.value = digits;
+      }
+    });
+    valueInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commitEditor();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeEditor();
+      }
+    });
+    valueInput.addEventListener('blur', commitEditor);
+
+    row.append(name, slider, valueEl, valueInput);
+    return { row, sync };
+  };
+
+  const plain = (v: number): string => String(v);
+  const padSlider = buildSlider(
+    'Padding',
+    PADDING_VALUES,
+    opts.padding,
+    plain,
+    (value) => {
+      setPadding(value);
+    },
+    { min: 0, max: 100 },
+    () => overlay.snapshotForUndo(),
+  );
+
+  const thicknessSlider = buildSlider(
+    'Line thickness',
+    THICKNESS_STOPS,
+    opts.outlineWidth,
+    plain,
+    (value) => {
+      opts.outlineWidth = value;
+      overlay.setOptions({ outlineWidth: value });
+      overlay.applyToActive({ outlineWidth: value });
+      saveSetting(THICKNESS_KEY, value);
+      syncReset();
+    },
+    { min: 1, max: 100 },
+    () => overlay.snapshotForUndo(),
+  );
+
+  const radiusSlider = buildSlider(
+    'Border radius',
+    RADIUS_STOPS,
+    opts.radius,
+    plain,
+    (value) => {
+      opts.radius = value;
+      overlay.setOptions({ radius: value });
+      overlay.applyToActive({ radius: value });
+      saveSetting(RADIUS_KEY, value);
+      syncReset();
+    },
+    { min: 0, max: 100 },
+    () => overlay.snapshotForUndo(),
+  );
+
+  const dimLevel = (v: number): string => String(Math.round(v * 100));
+  const dimSlider = buildSlider(
+    'Background dim',
+    DIM_STOPS,
+    opts.dim,
+    dimLevel,
+    (value) => {
+      opts.dim = value;
+      overlay.setOptions({ dim: value });
+      saveSetting(DIM_KEY, value);
+      syncReset();
+    },
+    { min: 0, max: 100, toRaw: (n: number): number => n / 100 },
+  );
+
+  // The toggle shortcut is a browser-global command (manifest `commands`,
+  // handled in the background worker) so it works on every tab. Binding lives
+  // at chrome://extensions/shortcuts, opened via the footer link below.
+  const resetBtn = makeBtn('Reset', {
+    className: 'nhost-ss-set-reset',
+    title: 'Restore all settings to their defaults',
+  });
+  // Disabled when every slider is at its default. Reset only touches the
+  // sliders — the current color is left as-is (and its history untouched).
+  syncReset = () => {
+    resetBtn.disabled =
+      opts.padding === PADDING_DEFAULT_ON &&
+      opts.outlineWidth === DEFAULT_OPTIONS.outlineWidth &&
+      opts.radius === DEFAULT_OPTIONS.radius &&
+      opts.dim === DEFAULT_OPTIONS.dim;
+  };
+  resetBtn.addEventListener('click', () => {
+    // One snapshot up front so a whole Reset is a single Undo step for the
+    // active selection (a no-op when nothing is selected).
+    overlay.snapshotForUndo();
+    // Padding.
+    setPadding(PADDING_DEFAULT_ON);
+    padSlider.sync(PADDING_DEFAULT_ON);
+    // Line thickness.
+    opts.outlineWidth = DEFAULT_OPTIONS.outlineWidth;
+    overlay.setOptions({ outlineWidth: DEFAULT_OPTIONS.outlineWidth });
+    overlay.applyToActive({ outlineWidth: DEFAULT_OPTIONS.outlineWidth });
+    saveSetting(THICKNESS_KEY, DEFAULT_OPTIONS.outlineWidth);
+    thicknessSlider.sync(DEFAULT_OPTIONS.outlineWidth);
+    // Border radius.
+    opts.radius = DEFAULT_OPTIONS.radius;
+    overlay.setOptions({ radius: DEFAULT_OPTIONS.radius });
+    overlay.applyToActive({ radius: DEFAULT_OPTIONS.radius });
+    saveSetting(RADIUS_KEY, DEFAULT_OPTIONS.radius);
+    radiusSlider.sync(DEFAULT_OPTIONS.radius);
+    // Background dim.
+    opts.dim = DEFAULT_OPTIONS.dim;
+    overlay.setOptions({ dim: DEFAULT_OPTIONS.dim });
+    saveSetting(DIM_KEY, DEFAULT_OPTIONS.dim);
+    dimSlider.sync(DEFAULT_OPTIONS.dim);
+    syncReset();
+  });
+  syncReset();
+
+  // Forget everything remembered "as history": the spotlight selections and
+  // their undo history on every page, the recent-colors list, and the current
+  // outline color (back to white). The sliders are left to the Reset button.
+  const clearAllHistory = () => {
+    // Current page: drop the live spotlights + undo history. onSelectionChange
+    // then persists the now-empty selection/history for this path and re-syncs
+    // the Undo/Clear buttons.
+    overlay.clearAll();
+    // Every other page: sweep the stored per-path selection/history entries.
+    const selPrefix = selectionKey('');
+    const histPrefix = historyKey('');
+    try {
+      for (let i = sessionStorage.length - 1; i >= 0; i--) {
+        const key = sessionStorage.key(i);
+        if (key && (key.startsWith(selPrefix) || key.startsWith(histPrefix))) {
+          sessionStorage.removeItem(key);
+        }
+      }
+      localStorage.removeItem(RECENT_COLORS_KEY);
+    } catch {
+      // Storage may be unavailable (private mode / blocked) — best-effort.
+    }
+    recentColors = [WHITE_COLOR];
+    applyColor(WHITE_COLOR, true);
+    renderColorPop();
+    syncClearHistory();
+  };
+
+  // Footer: Hotkey, Clear history, and Reset side by side in one row.
+  const footerRow = document.createElement('div');
+  footerRow.className = 'nhost-ss-set-row nhost-ss-set-footer';
+  const hotkeyBtn = makeBtn('Hotkey', {
+    className: 'nhost-ss-set-reset',
+    title: 'Set the toggle keyboard shortcut',
+  });
+  // The dev harness stubs chrome.runtime without an extension id, and
+  // chrome://extensions/shortcuts can't be opened there — disable the button so
+  // it doesn't look broken.
+  if (chrome.runtime.id) {
+    hotkeyBtn.addEventListener('click', () => requestOpenShortcuts());
+  } else {
+    hotkeyBtn.disabled = true;
+  }
+  const clearHistoryBtn = makeBtn('Clear history', {
+    className: 'nhost-ss-set-reset nhost-ss-set-clear',
+    title: 'Forget saved outlines, spotlights, and recent colors on every page',
+  });
+  clearHistoryBtn.addEventListener('click', clearAllHistory);
+  footerRow.append(hotkeyBtn, clearHistoryBtn, resetBtn);
+
+  // Append the settings below the color row in the shared popover.
+  colorPop.append(
+    padSlider.row,
+    thicknessSlider.row,
+    radiusSlider.row,
+    dimSlider.row,
+    footerRow,
+  );
+
+  // --- Capture / close ---
+  const captureBtn = iconBtn(
+    ICONS.camera,
+    'nhost-ss-btn nhost-ss-capture',
+    'Capture screenshot',
+  );
+  const closeBtn = iconBtn(
+    ICONS.close,
+    'nhost-ss-close nhost-ss-close--pinned',
+    'Close Nshot',
+  );
+
+  // Layout: the frame is a 3-column grid (1fr / auto / 1fr) so Select (the
+  // center column) is always screen-centered regardless of the side widths. The
+  // left group (undo, swatch) and Select + Clear together
+  // read as one pill. The left group collapses to zero width when not picking
+  // and slides open when select mode is toggled on; Select never moves. The
+  // close button is pinned to the right edge. There is no dim button — dimming
+  // is automatic (see below).
+  const leftGroup = document.createElement('div');
+  leftGroup.className = 'nhost-ss-leftgroup';
+  leftGroup.append(undoBtn, outlineBtn);
+
+  const rightGroup = document.createElement('div');
+  rightGroup.className = 'nhost-ss-rightgroup';
+  rightGroup.append(clearBtn, captureBtn);
+
+  frame.append(leftGroup, selectBtn, rightGroup, closeBtn, colorPop);
+
+  // --- Save modal (built once, shown by appending the backdrop) ---
+  const backdrop = document.createElement('div');
+  backdrop.className = 'nhost-ss-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'nhost-ss-modal';
+
+  const modalHead = document.createElement('div');
+  modalHead.className = 'nhost-ss-modal-head';
+  const modalTitle = document.createElement('div');
+  modalTitle.className = 'nhost-ss-modal-title';
+  modalTitle.textContent = 'Save screenshot';
+  const modalClose = iconBtn(ICONS.close, 'nhost-ss-close', 'Close');
+  modalHead.append(modalTitle, modalClose);
+
+  // The preview sits in a wrapper so the full-screen expand button can overlay
+  // it without being wiped by the spinner<->image swaps below.
+  const previewWrap = document.createElement('div');
+  previewWrap.className = 'nhost-ss-preview-wrap';
+  const preview = document.createElement('div');
+  preview.className = 'nhost-ss-preview';
+  const previewImg = document.createElement('img');
+  previewImg.alt = 'Screenshot preview';
+  const spinner = document.createElement('div');
+  spinner.className = 'nhost-ss-spinner';
+  const cropBtn = makeBtn('Crop', { className: 'nhost-ss-crop-toggle' });
+  const resetCropBtn = makeBtn('Reset crop', {
+    className: 'nhost-ss-crop-reset',
+  });
+
+  // Crop overlay: sits over the preview image while cropping. The selection
+  // rectangle paints a huge box-shadow to dim everything outside it; its
+  // interior drags to reposition (grab/grabbing) and eight transparent edge
+  // and corner zones resize it.
+  const cropLayer = document.createElement('div');
+  cropLayer.className = 'nhost-ss-crop';
+  const cropRect = document.createElement('div');
+  cropRect.className = 'nhost-ss-crop-rect';
+  const cropHandles = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].map(
+    (pos) => {
+      const handle = document.createElement('div');
+      handle.className = `nhost-ss-crop-h is-${pos}`;
+      handle.dataset.pos = pos;
+      return handle;
+    },
+  );
+  cropRect.append(...cropHandles);
+  cropLayer.append(cropRect);
+  previewWrap.append(preview, cropLayer);
+
+  // Persistent row below the preview. Reset crop sits on the left; the right
+  // side shows Crop normally and swaps to Cancel/Apply while cropping. Keeping
+  // the row mounted at all times stops the modal from jumping on crop entry.
+  const cropBar = document.createElement('div');
+  cropBar.className = 'nhost-ss-crop-bar';
+  const cropBarLeft = document.createElement('div');
+  cropBarLeft.className = 'nhost-ss-crop-left';
+  cropBarLeft.append(resetCropBtn);
+  const cropBarRight = document.createElement('div');
+  cropBarRight.className = 'nhost-ss-crop-right';
+  const cropCancelBtn = makeBtn('Cancel', {
+    className: 'nhost-ss-crop-cancel',
+  });
+  const cropApplyBtn = makeBtn('Apply', {
+    className: 'is-primary nhost-ss-crop-apply',
+  });
+  cropBarRight.append(cropApplyBtn, cropCancelBtn, cropBtn);
+  cropBar.append(cropBarLeft, cropBarRight);
+
+  // Full-screen preview overlay (appended to the shadow on demand, above the
+  // modal). Click anywhere or press Esc to dismiss.
+  const fsOverlay = document.createElement('div');
+  fsOverlay.className = 'nhost-ss-fs';
+  const fsImg = document.createElement('img');
+  fsImg.alt = 'Screenshot full view';
+  fsOverlay.appendChild(fsImg);
+
+  // Controls row above the preview: filename field, then Save as / download /
+  // copy. "Save as" opens the browser's native save dialog (pick any location);
+  // download/copy are icon-only.
+  const controls = document.createElement('div');
+  controls.className = 'nhost-ss-controls';
+
+  const field = document.createElement('div');
+  field.className = 'nhost-ss-field';
+  const filename = document.createElement('input');
+  filename.type = 'text';
+  filename.spellcheck = false;
+  filename.placeholder = 'Filename';
+  field.append(filename);
+
+  const saveAsBtn = makeBtn('Save as', { className: 'is-primary' });
+  const downloadBtn = iconBtn(ICONS.download, 'nhost-ss-actbtn', 'Download');
+  const copyBtn = iconBtn(ICONS.copy, 'nhost-ss-actbtn', 'Copy');
+  controls.append(field, saveAsBtn, downloadBtn, copyBtn);
+
+  const status = document.createElement('div');
+  status.className = 'nhost-ss-status';
+
+  modal.append(modalHead, controls, previewWrap, cropBar, status);
+  backdrop.appendChild(modal);
+
+  shadow.append(style, frame);
+
+  // --- State + helpers ---
+  // capturedDataUrl is what save/download/copy act on — it tracks the latest
+  // crop. originalDataUrl is the untouched capture so a crop can be reset.
+  let capturedDataUrl: string | null = null;
+  let originalDataUrl: string | null = null;
+
+  // Push the page down so the toolbar sits above the content instead of over
+  // it. We restore whatever inline padding-top the page had on the way out.
+  const docEl = document.documentElement;
+  let savedPaddingTop: string | null = null;
+  const pushPage = () => {
+    if (savedPaddingTop === null) {
+      savedPaddingTop = docEl.style.paddingTop;
+    }
+    docEl.style.setProperty('padding-top', `${TOOLBAR_HEIGHT}px`, 'important');
+  };
+  const restorePage = () => {
+    if (savedPaddingTop === null) {
+      return;
+    }
+    if (savedPaddingTop) {
+      docEl.style.setProperty('padding-top', savedPaddingTop);
+    } else {
+      docEl.style.removeProperty('padding-top');
+    }
+    savedPaddingTop = null;
+  };
+
+  const setStatus = (message: string, kind: '' | 'ok' | 'err' = '') => {
+    status.textContent = message;
+    status.className = `nhost-ss-status${kind ? ` is-${kind}` : ''}`;
+  };
+
+  const closeFs = () => {
+    fsOverlay.classList.remove('is-open');
+    fsOverlay.remove();
+  };
+  const openFs = () => {
+    if (!capturedDataUrl) {
+      return;
+    }
+    fsImg.src = capturedDataUrl;
+    shadow.appendChild(fsOverlay);
+    fsOverlay.classList.add('is-open');
+  };
+  const onModalKeydown = (event: KeyboardEvent) => {
+    if (event.key === 'Escape') {
+      event.stopPropagation();
+      // Step out of full-screen first; only then close the whole modal.
+      if (fsOverlay.isConnected) {
+        closeFs();
+        return;
+      }
+      closeModal();
+    }
+  };
+  const closeModal = () => {
+    document.removeEventListener('keydown', onModalKeydown, true);
+    exitCrop();
+    closeFs();
+    backdrop.remove();
+  };
+
+  const openModal = () => {
+    setStatus('');
+    filename.value = downloadFilename();
+    capturedDataUrl = null;
+    originalDataUrl = null;
+    exitCrop();
+    cropBtn.disabled = true;
+    updateResetCrop();
+    preview.replaceChildren(spinner);
+    shadow.appendChild(backdrop);
+    document.addEventListener('keydown', onModalKeydown, true);
+
+    void (async () => {
+      // Hide our own chrome so it is not baked into the flat capture, drop the
+      // push-down so the real page (not a blank strip) is captured, then
+      // re-render the spotlight against the reflowed layout before grabbing the
+      // live viewport pixels.
+      overlay.prepareForCapture();
+      frame.style.visibility = 'hidden';
+      backdrop.style.visibility = 'hidden';
+      // prepareForCapture() stops picking, which removes the popover's `is-open`
+      // class and starts its fade-out (a 0.12s opacity transition + delayed
+      // visibility). Capture fires after a single repaint, so a `visibility`
+      // hide would still catch it mid-fade. `display: none` is immediate and
+      // transition-proof, so the popover can never bake into the shot.
+      colorPop.style.display = 'none';
+      docEl.style.removeProperty('padding-top');
+      overlay.setOptions({ topInset: 0 });
+      overlay.refresh();
+      try {
+        await nextRepaint();
+        const dataUrl = await requestCapture();
+        capturedDataUrl = dataUrl;
+        originalDataUrl = dataUrl;
+        previewImg.src = dataUrl;
+        preview.replaceChildren(previewImg);
+        preview.classList.add('is-zoomable');
+        cropBtn.disabled = false;
+        updateResetCrop();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        preview.replaceChildren();
+        setStatus(message, 'err');
+      } finally {
+        frame.style.visibility = '';
+        backdrop.style.visibility = '';
+        colorPop.style.display = '';
+        // Always clear the capture flag so transparent guides reappear, even
+        // when the overlay was deactivated mid-capture.
+        overlay.endCapture();
+        if (active) {
+          pushPage();
+          overlay.setOptions({ topInset: TOOLBAR_HEIGHT });
+          overlay.refresh();
+        }
+      }
+    })();
+  };
+
+  // --- Crop ---
+  // Selection stored as fractions (0..1) of the displayed image so it stays
+  // valid regardless of the preview's render size.
+  interface CropSel {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  }
+  type CropDrag = {
+    kind: 'new' | 'move' | 'resize';
+    pos?: string;
+    startFx: number;
+    startFy: number;
+    startSel: CropSel;
+  };
+  let cropping = false;
+  let cropSel: CropSel | null = null;
+  // The displayed image's box in viewport coords, used to map pointer events.
+  let cropImgRect: DOMRect | null = null;
+  let cropDrag: CropDrag | null = null;
+
+  const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+
+  // While cropping, the only valid actions are Apply/Cancel, so the
+  // save/download/copy buttons are disabled.
+  const setActionsDisabled = (disabled: boolean) => {
+    saveAsBtn.disabled = disabled;
+    downloadBtn.disabled = disabled;
+    copyBtn.disabled = disabled;
+  };
+
+  const updateResetCrop = () => {
+    const cropped =
+      capturedDataUrl !== null && capturedDataUrl !== originalDataUrl;
+    resetCropBtn.disabled = !cropped;
+    resetCropBtn.style.display = cropped ? '' : 'none';
+  };
+
+  // Lay the crop layer exactly over the rendered image (which is centered in
+  // the preview and may be smaller than it).
+  const positionCropLayer = () => {
+    const imgRect = previewImg.getBoundingClientRect();
+    const wrapRect = previewWrap.getBoundingClientRect();
+    cropLayer.style.left = `${imgRect.left - wrapRect.left}px`;
+    cropLayer.style.top = `${imgRect.top - wrapRect.top}px`;
+    cropLayer.style.width = `${imgRect.width}px`;
+    cropLayer.style.height = `${imgRect.height}px`;
+    cropImgRect = imgRect;
+  };
+
+  const renderCropSel = () => {
+    if (!cropSel) {
+      cropRect.style.display = 'none';
+      return;
+    }
+    cropRect.style.display = 'block';
+    cropRect.style.left = `${cropSel.x * 100}%`;
+    cropRect.style.top = `${cropSel.y * 100}%`;
+    cropRect.style.width = `${cropSel.w * 100}%`;
+    cropRect.style.height = `${cropSel.h * 100}%`;
+  };
+
+  function exitCrop(): void {
+    cropping = false;
+    cropSel = null;
+    cropDrag = null;
+    cropLayer.style.cursor = '';
+    cropLayer.classList.remove('is-active');
+    cropBar.classList.remove('is-cropping');
+    preview.classList.toggle('is-zoomable', capturedDataUrl !== null);
+    setActionsDisabled(false);
+  }
+
+  const enterCrop = () => {
+    if (!capturedDataUrl) {
+      return;
+    }
+    cropping = true;
+    // Swap the bottom row to Cancel/Apply and disable the save/download/copy
+    // actions so the only choices are Apply or Cancel.
+    preview.classList.remove('is-zoomable');
+    setActionsDisabled(true);
+    cropLayer.classList.add('is-active');
+    cropBar.classList.add('is-cropping');
+    positionCropLayer();
+    // Start fully maximized — pull the edges or corners to shrink it.
+    cropSel = { x: 0, y: 0, w: 1, h: 1 };
+    renderCropSel();
+  };
+
+  const fracFromEvent = (event: PointerEvent) => {
+    if (!cropImgRect) {
+      return { fx: 0, fy: 0 };
+    }
+    return {
+      fx: clamp01((event.clientX - cropImgRect.left) / cropImgRect.width),
+      fy: clamp01((event.clientY - cropImgRect.top) / cropImgRect.height),
+    };
+  };
+
+  const cursorForPos = (pos: string): string => {
+    if (pos === 'nw' || pos === 'se') {
+      return 'nwse-resize';
+    }
+    if (pos === 'ne' || pos === 'sw') {
+      return 'nesw-resize';
+    }
+    if (pos === 'n' || pos === 's') {
+      return 'ns-resize';
+    }
+    return 'ew-resize';
+  };
+
+  const resizeCropSel = (
+    s: CropSel,
+    pos: string,
+    fx: number,
+    fy: number,
+  ): CropSel => {
+    let left = s.x;
+    let top = s.y;
+    let right = s.x + s.w;
+    let bottom = s.y + s.h;
+    if (pos.includes('w')) {
+      left = clamp01(Math.min(fx, right));
+    }
+    if (pos.includes('e')) {
+      right = clamp01(Math.max(fx, left));
+    }
+    if (pos.includes('n')) {
+      top = clamp01(Math.min(fy, bottom));
+    }
+    if (pos.includes('s')) {
+      bottom = clamp01(Math.max(fy, top));
+    }
+    return { x: left, y: top, w: right - left, h: bottom - top };
+  };
+
+  const loadImage = (src: string): Promise<HTMLImageElement> =>
+    new Promise((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = () => reject(new Error('Failed to load image'));
+      im.src = src;
+    });
+
+  const applyCrop = async () => {
+    if (!capturedDataUrl) {
+      return;
+    }
+    // Nothing to crop when there's no selection, a degenerate one, or the
+    // selection still covers the whole image.
+    const full =
+      cropSel !== null &&
+      cropSel.x < 0.005 &&
+      cropSel.y < 0.005 &&
+      cropSel.w > 0.995 &&
+      cropSel.h > 0.995;
+    if (!cropSel || cropSel.w < 0.01 || cropSel.h < 0.01 || full) {
+      exitCrop();
+      return;
+    }
+    const sel = cropSel;
+    try {
+      const img = await loadImage(capturedDataUrl);
+      const sx = Math.round(sel.x * img.naturalWidth);
+      const sy = Math.round(sel.y * img.naturalHeight);
+      const sw = Math.max(1, Math.round(sel.w * img.naturalWidth));
+      const sh = Math.max(1, Math.round(sel.h * img.naturalHeight));
+      const canvas = document.createElement('canvas');
+      canvas.width = sw;
+      canvas.height = sh;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        return;
+      }
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+      capturedDataUrl = canvas.toDataURL('image/png');
+      previewImg.src = capturedDataUrl;
+      exitCrop();
+      updateResetCrop();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`Crop failed: ${message}`, 'err');
+    }
+  };
+
+  const resetCrop = () => {
+    if (!originalDataUrl) {
+      return;
+    }
+    capturedDataUrl = originalDataUrl;
+    previewImg.src = originalDataUrl;
+    exitCrop();
+    updateResetCrop();
+  };
+
+  cropBtn.addEventListener('click', () => {
+    if (cropping) {
+      exitCrop();
+    } else {
+      enterCrop();
+    }
+  });
+  resetCropBtn.addEventListener('click', resetCrop);
+  cropApplyBtn.addEventListener('click', () => void applyCrop());
+  cropCancelBtn.addEventListener('click', exitCrop);
+
+  cropLayer.addEventListener('pointerdown', (event) => {
+    if (!cropping) {
+      return;
+    }
+    const target = event.target as HTMLElement;
+    event.preventDefault();
+    positionCropLayer();
+    const { fx, fy } = fracFromEvent(event);
+    cropLayer.setPointerCapture(event.pointerId);
+    const pos = target.dataset.pos;
+    if (cropSel && pos) {
+      cropDrag = {
+        kind: 'resize',
+        pos,
+        startFx: fx,
+        startFy: fy,
+        startSel: { ...cropSel },
+      };
+      cropLayer.style.cursor = cursorForPos(pos);
+    } else if (cropSel && target === cropRect) {
+      cropDrag = {
+        kind: 'move',
+        startFx: fx,
+        startFy: fy,
+        startSel: { ...cropSel },
+      };
+      cropLayer.style.cursor = 'grabbing';
+    } else {
+      cropSel = { x: fx, y: fy, w: 0, h: 0 };
+      cropDrag = {
+        kind: 'new',
+        startFx: fx,
+        startFy: fy,
+        startSel: { ...cropSel },
+      };
+      cropLayer.style.cursor = 'crosshair';
+      renderCropSel();
+    }
+  });
+  cropLayer.addEventListener('pointermove', (event) => {
+    if (!cropDrag || !cropSel) {
+      return;
+    }
+    const { fx, fy } = fracFromEvent(event);
+    const s = cropDrag.startSel;
+    if (cropDrag.kind === 'new') {
+      cropSel = {
+        x: Math.min(cropDrag.startFx, fx),
+        y: Math.min(cropDrag.startFy, fy),
+        w: Math.abs(fx - cropDrag.startFx),
+        h: Math.abs(fy - cropDrag.startFy),
+      };
+    } else if (cropDrag.kind === 'move') {
+      cropSel = {
+        x: clamp01(s.x + (fx - cropDrag.startFx)),
+        y: clamp01(s.y + (fy - cropDrag.startFy)),
+        w: s.w,
+        h: s.h,
+      };
+      cropSel.x = Math.min(cropSel.x, 1 - s.w);
+      cropSel.y = Math.min(cropSel.y, 1 - s.h);
+    } else if (cropDrag.kind === 'resize' && cropDrag.pos) {
+      cropSel = resizeCropSel(s, cropDrag.pos, fx, fy);
+    }
+    renderCropSel();
+  });
+  const endCropDrag = (event: PointerEvent) => {
+    if (cropDrag) {
+      cropLayer.releasePointerCapture(event.pointerId);
+      cropDrag = null;
+      cropLayer.style.cursor = '';
+    }
+  };
+  cropLayer.addEventListener('pointerup', endCropDrag);
+  cropLayer.addEventListener('pointercancel', endCropDrag);
+
+  // --- Wiring: toolbar ---
+  // Dim is automatic: the page dims whenever the spotlight is in use — while
+  // picking, or whenever at least one element is selected. Keeping it on for a
+  // non-empty selection (not just while picking) means the dim survives the
+  // capture, where picking is stopped right before the screenshot is taken.
+  const syncAutoDim = () => {
+    const on = overlay.isPicking || overlay.selectionCount > 0;
+    opts.dimEnabled = on;
+    overlay.setOptions({ dimEnabled: on });
+  };
+
+  // Undo is only usable while picking (select mode) and only when there is a
+  // prior selection state to step back to. A Clear still records a state, so it
+  // can be undone once back in select mode.
+  const syncUndo = () => {
+    undoBtn.disabled = !(overlay.isPicking && overlay.canUndo);
+  };
+
+  // Clear is only meaningful when something is selected.
+  const syncClear = () => {
+    clearBtn.disabled = overlay.selectionCount === 0;
+  };
+
+  // "Clear history" is only meaningful when there is something remembered to
+  // wipe: a live/stored spotlight (any page), stored undo history, a picked
+  // recent color, or a non-default outline color.
+  const hasHistory = (): boolean => {
+    if (overlay.selectionCount > 0) {
+      return true;
+    }
+    const selPrefix = selectionKey('');
+    const histPrefix = historyKey('');
+    try {
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i);
+        if (
+          key &&
+          (key.startsWith(selPrefix) || key.startsWith(histPrefix)) &&
+          readStored(key).length > 0
+        ) {
+          return true;
+        }
+      }
+    } catch {
+      // Storage unavailable — fall through to the color checks.
+    }
+    const colorsDirty =
+      recentColors.length !== 1 ||
+      recentColors[0]?.toLowerCase() !== WHITE_COLOR;
+    return colorsDirty || opts.outlineColor.toLowerCase() !== WHITE_COLOR;
+  };
+  const syncClearHistory = () => {
+    clearHistoryBtn.disabled = !hasHistory();
+  };
+  syncClearHistory();
+
+  // Don't persist the selection wipe that overlay.deactivate() triggers when
+  // the tool is closed — we want picks remembered for the next activation.
+  let suppressSelectionSave = false;
+
+  // Resilient restore. On SPAs (and sometimes on a plain reload) the picked
+  // nodes aren't in the DOM yet when the content script runs at document_idle,
+  // so their stored selectors resolve to nothing and the spotlight looks lost.
+  // We re-resolve as the DOM grows — suppressing persistence meanwhile so a
+  // partial resolve never overwrites the stored set — until every pick resolves
+  // or we give up after RESTORE_RETRY_MS.
+  const RESTORE_RETRY_MS = 5000;
+  let restoreObserver: MutationObserver | null = null;
+  let restoreTimer = 0;
+
+  const cancelRestoreRetry = (): void => {
+    restoreObserver?.disconnect();
+    restoreObserver = null;
+    if (restoreTimer) {
+      window.clearTimeout(restoreTimer);
+      restoreTimer = 0;
+    }
+  };
+
+  const restorePersisted = (path: string): void => {
+    cancelRestoreRetry();
+    const expected = readStored(selectionKey(path)).length;
+    let lastCount = -1;
+    // Re-resolve and re-apply, but only touch the overlay when the resolved
+    // count actually changes; returns true once every stored pick resolved (or
+    // none were stored, which also clears the overlay for this page).
+    const attempt = (): boolean => {
+      const entries = loadSelection(path);
+      if (entries.length !== lastCount) {
+        lastCount = entries.length;
+        overlay.restoreSelection(entries, loadHistory(path));
+      }
+      return entries.length >= expected;
+    };
+    suppressSelectionSave = true;
+    if (attempt()) {
+      suppressSelectionSave = false;
+      return;
+    }
+    let scheduled = false;
+    restoreObserver = new MutationObserver(() => {
+      if (scheduled) {
+        return;
+      }
+      scheduled = true;
+      requestAnimationFrame(() => {
+        scheduled = false;
+        if (attempt()) {
+          cancelRestoreRetry();
+          suppressSelectionSave = false;
+        }
+      });
+    });
+    restoreObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+    restoreTimer = window.setTimeout(() => {
+      cancelRestoreRetry();
+      suppressSelectionSave = false;
+    }, RESTORE_RETRY_MS);
+  };
+
+  overlay.onPickingChange = (picking) => {
+    selectBtn.classList.toggle('is-active', picking);
+    // Slide the left group (swatch, padding, settings, undo) open while picking
+    // and collapse it otherwise.
+    frame.classList.toggle('is-picking', picking);
+    syncAutoDim();
+    syncUndo();
+    if (picking) {
+      // Re-entering select mode restores the popover if it was open when we last
+      // left (Esc / Select / capture / deactivate), at its remembered spot.
+      if (popWantOpen) {
+        openColorPop();
+      }
+    } else {
+      // Leaving select mode: remember whether it was open, then hide it so
+      // coming back can match that state.
+      popWantOpen = colorPopOpen;
+      closeColorPop();
+    }
+  };
+  overlay.onSelectionChange = () => {
+    if (!suppressSelectionSave) {
+      saveSelection(overlay.getSelection());
+      saveHistory(overlay.getHistory());
+    }
+    syncAutoDim();
+    syncUndo();
+    syncClear();
+    syncClearHistory();
+  };
+
+  const toggleSelect = () => {
+    overlay.togglePicking();
+  };
+  selectBtn.addEventListener('click', toggleSelect);
+  undoBtn.addEventListener('click', () => overlay.undo());
+  clearBtn.addEventListener('click', () => overlay.clearSelection());
+
+  // Dismiss the color popover when clicking elsewhere in the toolbar. Undo and
+  // Clear are exempt so adjusting selections in select mode keeps it open.
+  // Select is exempt too: re-entering select mode auto-reopens the popover (via
+  // onPickingChange) on the same click, so without this the click would bubble
+  // here and immediately close what it just opened.
+  shadow.addEventListener('click', (event) => {
+    const target = event.target as Node;
+    if (
+      colorPopOpen &&
+      !colorPop.contains(target) &&
+      !outlineBtn.contains(target) &&
+      !selectBtn.contains(target) &&
+      !clearBtn.contains(target) &&
+      !undoBtn.contains(target)
+    ) {
+      closeColorPop();
+    }
+  });
+
+  captureBtn.addEventListener('click', openModal);
+  closeBtn.addEventListener('click', () => deactivate());
+
+  // Clicking anywhere outside the toolbar (on the page) dismisses the color
+  // popover. Clicks inside the toolbar retarget to the shadow host, so they are
+  // recognised as "inside" and handled by the in-toolbar dismiss logic above.
+  const handleOutsideClick = (event: MouseEvent) => {
+    if (!host.contains(event.target as Node)) {
+      closeColorPop();
+    }
+  };
+
+  // --- Wiring: modal ---
+  modalClose.addEventListener('click', closeModal);
+  // Only dismiss when the press both starts and ends on the backdrop itself. A
+  // text selection that begins inside the modal (e.g. on the filename) and
+  // drags onto the backdrop must not close it.
+  let pressedOnBackdrop = false;
+  backdrop.addEventListener('mousedown', (event) => {
+    pressedOnBackdrop = event.target === backdrop;
+  });
+  backdrop.addEventListener('click', (event) => {
+    if (event.target === backdrop && pressedOnBackdrop) {
+      closeModal();
+    }
+    pressedOnBackdrop = false;
+  });
+  // Click anywhere on the preview opens the full-screen view. While cropping,
+  // the crop layer sits on top and swallows these clicks.
+  preview.addEventListener('click', () => {
+    if (!cropping) {
+      openFs();
+    }
+  });
+  fsOverlay.addEventListener('click', closeFs);
+  saveAsBtn.addEventListener('click', () => {
+    if (!capturedDataUrl) {
+      return;
+    }
+    // saveAs: true makes the browser open its native "Save As" dialog, so the
+    // user picks the location and confirms the filename. Close on success.
+    void requestDownload(capturedDataUrl, filename.value, true)
+      .then(() => closeModal())
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(`Save failed: ${message}`, 'err');
+      });
+  });
+  downloadBtn.addEventListener('click', () => {
+    if (!capturedDataUrl) {
+      return;
+    }
+    void requestDownload(capturedDataUrl, filename.value)
+      .then(() => closeModal())
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(message, 'err');
+      });
+  });
+  copyBtn.addEventListener('click', () => {
+    if (!capturedDataUrl) {
+      return;
+    }
+    void copyBlobToClipboard(dataUrlToBlob(capturedDataUrl))
+      .then(() => setStatus('Copied to clipboard.', 'ok'))
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(message, 'err');
+      });
+  });
+
+  // Spotlight selections are per-page. In a single-page app, client-side
+  // navigation changes location.pathname without a reload, so the in-memory
+  // picks would otherwise bleed onto the next page. We watch the path and swap
+  // to the destination page's saved set (empty → clears the overlay). Content
+  // scripts run in an isolated world where the page's history.pushState can't
+  // be patched, so we poll the path and also catch back/forward via popstate.
+  let currentPath = location.pathname;
+  let navPollId = 0;
+  const handleNavigation = () => {
+    if (!active || location.pathname === currentPath) {
+      return;
+    }
+    currentPath = location.pathname;
+    // The outgoing page's picks were already persisted on every change, so we
+    // only need to load the destination's; restorePersisted clears the overlay
+    // when this page has none, and retries if its targets render late.
+    restorePersisted(currentPath);
+  };
+
+  function activate(): void {
+    if (active) {
+      return;
+    }
+    active = true;
+    saveActive(true);
+
+    document.documentElement.appendChild(host);
+    document.addEventListener('click', handleOutsideClick);
+    currentPath = location.pathname;
+    window.addEventListener('popstate', handleNavigation);
+    navPollId = window.setInterval(handleNavigation, 300);
+    pushPage();
+    opts.topInset = TOOLBAR_HEIGHT;
+    overlay.activate();
+    overlay.setOptions(opts);
+
+    // Restore any spotlight selection persisted for this page (after a reload
+    // or a round-trip navigation). Retries as the DOM settles so late-rendered
+    // (SPA) targets aren't missed; re-triggers auto-dim via the
+    // selection-change handler.
+    restorePersisted(location.pathname);
+
+    // Deliberately NOT startPicking(): the toolbar always opens in read mode. A
+    // fresh toggle-on or a page reload never drops the user straight into Select
+    // (picking) mode — that is disorienting. Select mode is entered only by an
+    // explicit Select click within the session, and is never persisted.
+  }
+
+  function deactivate(): void {
+    if (!active) {
+      return;
+    }
+    active = false;
+    saveActive(false);
+    closeModal();
+    // No closeColorPop() here: overlay.deactivate() below stops picking, which
+    // hides the popover via onPickingChange while remembering whether it was
+    // open, so it can reappear when the user next enters Select mode.
+    document.removeEventListener('click', handleOutsideClick);
+    window.removeEventListener('popstate', handleNavigation);
+    if (navPollId) {
+      window.clearInterval(navPollId);
+      navPollId = 0;
+    }
+    host.remove();
+    cancelRestoreRetry();
+    suppressSelectionSave = true;
+    overlay.deactivate();
+    suppressSelectionSave = false;
+    restorePage();
+  }
+
+  // Re-open automatically after a full page reload if the tab had it open. The
+  // declarative content script re-runs on every load, so this restores the
+  // toolbar without the user pressing the shortcut again.
+  if (loadActive()) {
+    activate();
+  }
+
+  return {
+    toggle: () => (active ? deactivate() : activate()),
+    activate,
+    deactivate,
+    get active() {
+      return active;
+    },
+  };
+}
