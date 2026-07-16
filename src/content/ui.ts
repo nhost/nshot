@@ -1416,6 +1416,10 @@ export function createToolbar(): Toolbar {
       // hide would still catch it mid-fade. `display: none` is immediate and
       // transition-proof, so the popover can never bake into the shot.
       colorPop.style.display = 'none';
+      // The frozen banner is position:fixed (its own layer), so the frame's
+      // inherited visibility:hidden doesn't reliably keep it out of
+      // captureVisibleTab — hide it outright, same as the popover above.
+      frozenHint.style.display = 'none';
       docEl.style.removeProperty('padding-top');
       overlay.setOptions({ topInset: 0 });
       overlay.refresh();
@@ -1457,6 +1461,9 @@ export function createToolbar(): Toolbar {
         frame.style.visibility = '';
         backdrop.style.visibility = '';
         colorPop.style.display = '';
+        // Restore the banner's class-driven visibility (shows again only if the
+        // freeze is still active).
+        frozenHint.style.display = '';
         // Always clear the capture flag so transparent guides reappear, even
         // when the overlay was deactivated mid-capture.
         overlay.endCapture();
