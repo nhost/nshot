@@ -461,6 +461,28 @@ export class OverlayController {
     return this.selected.map((s) => ({ ...s }));
   }
 
+  /** Bounding box (viewport CSS px) enclosing every spotlit element plus its
+   * per-element padding — i.e. the visible extent of the whole spotlight.
+   * Null when nothing is selected. Read at capture time by the toolbar's
+   * smart crop, so it maps directly onto the captured viewport pixels. */
+  getSelectionViewportBounds(): DocRect | null {
+    if (this.selected.length === 0) {
+      return null;
+    }
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const s of this.selected) {
+      const r = viewRect(s.el, s.padding);
+      minX = Math.min(minX, r.x);
+      minY = Math.min(minY, r.y);
+      maxX = Math.max(maxX, r.x + r.w);
+      maxY = Math.max(maxY, r.y + r.h);
+    }
+    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+  }
+
   togglePicking(): void {
     if (this.picking) {
       this.stopPicking();

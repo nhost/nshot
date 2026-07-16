@@ -685,7 +685,8 @@ export const FRAME_STYLES = `
 }
 .nhost-ss-crop-cancel,
 .nhost-ss-crop-apply { display: none; }
-.nhost-ss-crop-bar.is-cropping .nhost-ss-crop-toggle { display: none; }
+.nhost-ss-crop-bar.is-cropping .nhost-ss-crop-toggle,
+.nhost-ss-crop-bar.is-cropping .nhost-ss-crop-smart { display: none; }
 .nhost-ss-crop-bar.is-cropping .nhost-ss-crop-cancel,
 .nhost-ss-crop-bar.is-cropping .nhost-ss-crop-apply { display: flex; }
 .nhost-ss-crop-bar.is-cropping .nhost-ss-crop-reset { display: none; }

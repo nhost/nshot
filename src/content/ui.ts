@@ -354,6 +354,8 @@ const ICONS = {
 // pushed down by exactly this much while the tool is active, so the bar sits
 // above the page rather than over it.
 const TOOLBAR_HEIGHT = 44;
+// Breathing room (viewport px) added around the spotlight by Smart crop.
+const SMART_CROP_PADDING = 24;
 
 /** Flat download name with a timestamp, e.g. `screenshot-2026-06-28-143022.png`.
  * No nested folders — downloads land directly in the browser's download dir. */
@@ -1239,6 +1241,11 @@ export function createToolbar(): Toolbar {
   const resetCropBtn = makeBtn('Reset crop', {
     className: 'nhost-ss-crop-reset',
   });
+  const smartCropBtn = makeBtn('Smart crop', {
+    className: 'nhost-ss-crop-smart',
+  });
+  smartCropBtn.title = 'Crop to the spotlighted area, with a little padding';
+  smartCropBtn.style.display = 'none';
 
   // Crop overlay: sits over the preview image while cropping. The selection
   // rectangle paints a huge box-shadow to dim everything outside it; its
@@ -1276,7 +1283,7 @@ export function createToolbar(): Toolbar {
   const cropApplyBtn = makeBtn('Apply', {
     className: 'is-primary nhost-ss-crop-apply',
   });
-  cropBarRight.append(cropApplyBtn, cropCancelBtn, cropBtn);
+  cropBarRight.append(cropApplyBtn, cropCancelBtn, smartCropBtn, cropBtn);
   cropBar.append(cropBarLeft, cropBarRight);
 
   // Full-screen preview overlay (appended to the shadow on demand, above the
@@ -1319,6 +1326,10 @@ export function createToolbar(): Toolbar {
   // crop. originalDataUrl is the untouched capture so a crop can be reset.
   let capturedDataUrl: string | null = null;
   let originalDataUrl: string | null = null;
+  // The spotlight's extent captured as image fractions (0..1) at screenshot
+  // time, so Smart crop can shrink to the selected area regardless of the
+  // preview's render size or the image's devicePixelRatio scaling.
+  let smartCropSel: CropSel | null = null;
 
   // Push the page down so the toolbar sits above the content instead of over
   // it. We restore whatever inline padding-top the page had on the way out.
@@ -1382,9 +1393,11 @@ export function createToolbar(): Toolbar {
     filename.value = downloadFilename();
     capturedDataUrl = null;
     originalDataUrl = null;
+    smartCropSel = null;
     exitCrop();
     cropBtn.disabled = true;
     updateResetCrop();
+    updateSmartCrop();
     preview.replaceChildren(spinner);
     shadow.appendChild(backdrop);
     document.addEventListener('keydown', onModalKeydown, true);
@@ -1408,6 +1421,25 @@ export function createToolbar(): Toolbar {
       overlay.refresh();
       try {
         await nextRepaint();
+        // Snapshot the spotlight's extent against the (push-down-free) capture
+        // viewport as image fractions, so Smart crop can shrink to it later.
+        const bounds = overlay.getSelectionViewportBounds();
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        if (bounds && vw > 0 && vh > 0) {
+          const padX = SMART_CROP_PADDING / vw;
+          const padY = SMART_CROP_PADDING / vh;
+          const x = clamp01(bounds.x / vw - padX);
+          const y = clamp01(bounds.y / vh - padY);
+          const right = clamp01((bounds.x + bounds.w) / vw + padX);
+          const bottom = clamp01((bounds.y + bounds.h) / vh + padY);
+          smartCropSel =
+            right - x > 0.01 && bottom - y > 0.01
+              ? { x, y, w: right - x, h: bottom - y }
+              : null;
+        } else {
+          smartCropSel = null;
+        }
         const dataUrl = await requestCapture();
         capturedDataUrl = dataUrl;
         originalDataUrl = dataUrl;
@@ -1416,6 +1448,7 @@ export function createToolbar(): Toolbar {
         preview.classList.add('is-zoomable');
         cropBtn.disabled = false;
         updateResetCrop();
+        updateSmartCrop();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         preview.replaceChildren();
@@ -1634,6 +1667,26 @@ export function createToolbar(): Toolbar {
     updateResetCrop();
   };
 
+  // Show Smart crop only when the capture actually had a spotlight to shrink to.
+  const updateSmartCrop = () => {
+    const has = smartCropSel !== null;
+    smartCropBtn.style.display = has ? '' : 'none';
+    smartCropBtn.disabled = !has;
+  };
+
+  // One-click crop to the spotlighted area (plus padding), always taken from
+  // the original untouched capture so it's independent of any manual crop.
+  const smartCrop = async () => {
+    if (!smartCropSel || !originalDataUrl) {
+      return;
+    }
+    exitCrop();
+    capturedDataUrl = originalDataUrl;
+    previewImg.src = originalDataUrl;
+    cropSel = { ...smartCropSel };
+    await applyCrop();
+  };
+
   cropBtn.addEventListener('click', () => {
     if (cropping) {
       exitCrop();
@@ -1642,6 +1695,7 @@ export function createToolbar(): Toolbar {
     }
   });
   resetCropBtn.addEventListener('click', resetCrop);
+  smartCropBtn.addEventListener('click', () => void smartCrop());
   cropApplyBtn.addEventListener('click', () => void applyCrop());
   cropCancelBtn.addEventListener('click', exitCrop);
 
