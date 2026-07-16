@@ -448,6 +448,22 @@ export function createToolbar(): Toolbar {
   host.setAttribute('data-nhost-ss-nocapture', '');
   const shadow = host.attachShadow({ mode: 'open' });
 
+  // While a UI is frozen, keep the toolbar's own pointer events from reaching
+  // the page. Many popovers close on an outside pointerdown/click on document,
+  // and a click on our toolbar would otherwise count as "outside" and dismiss
+  // the very UI we're trying to capture. We stop propagation on the way out of
+  // the shadow host — after our own buttons have already handled the event — so
+  // the page's document-level close handlers never see it. (Page handlers bound
+  // in the capture phase can still fire; that stays a documented limitation.)
+  const containWhileFrozen = (event: Event) => {
+    if (freezeController.isFrozen) {
+      event.stopPropagation();
+    }
+  };
+  for (const type of ['pointerdown', 'mousedown', 'click']) {
+    host.addEventListener(type, containWhileFrozen);
+  }
+
   const style = document.createElement('style');
   style.textContent = FRAME_STYLES;
 
