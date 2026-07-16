@@ -1200,7 +1200,7 @@ export function createToolbar(): Toolbar {
   const frozenHint = document.createElement('div');
   frozenHint.className = 'nhost-ss-frozen-hint';
   frozenHint.textContent =
-    '❄ Frozen — click the UI to spotlight, then Capture · Esc to release';
+    '❄ Frozen — click the UI to spotlight · Ctrl/⌘+Enter to capture · Esc to release';
 
   frame.append(
     leftGroup,
@@ -1913,13 +1913,20 @@ export function createToolbar(): Toolbar {
     }
   };
 
-  // In-page fallback for the freeze shortcut. The browser-global `freeze-ui`
-  // command only fires once its key is bound at chrome://extensions/shortcuts —
-  // Chrome doesn't auto-bind commands added to an already-installed extension —
-  // so while the toolbar is open we also watch for Ctrl/Cmd+Shift+F ourselves,
-  // making freeze work out of the box. If the command IS bound the browser
-  // intercepts the chord before the page sees it, so there is no double-fire.
-  const handleFreezeKey = (event: KeyboardEvent) => {
+  // In-page keyboard shortcuts, active while the toolbar is open:
+  //
+  //  • Ctrl/Cmd+Shift+F — freeze. A fallback for the browser-global `freeze-ui`
+  //    command, which only fires once its key is bound at
+  //    chrome://extensions/shortcuts (Chrome doesn't auto-bind commands added
+  //    to an already-installed extension). If the command IS bound the browser
+  //    intercepts the chord first, so there is no double-fire.
+  //  • Ctrl/Cmd+Enter — capture. Clicking the toolbar's camera button registers
+  //    as an outside click on the page, which dismisses popovers that close on
+  //    an outside pointerdown (e.g. Radix, which listens in the capture phase
+  //    and can't be intercepted without breaking our own button). Capturing
+  //    from the keyboard emits no page pointer event, so a frozen UI survives
+  //    into the shot.
+  const handleToolKeys = (event: KeyboardEvent) => {
     if (
       event.code === 'KeyF' &&
       event.shiftKey &&
@@ -1927,6 +1934,15 @@ export function createToolbar(): Toolbar {
     ) {
       event.preventDefault();
       freeze();
+      return;
+    }
+    if (
+      event.code === 'Enter' &&
+      (event.metaKey || event.ctrlKey) &&
+      !backdrop.isConnected
+    ) {
+      event.preventDefault();
+      openModal();
     }
   };
 
@@ -2039,7 +2055,7 @@ export function createToolbar(): Toolbar {
 
     document.documentElement.appendChild(host);
     document.addEventListener('click', handleOutsideClick);
-    document.addEventListener('keydown', handleFreezeKey, true);
+    document.addEventListener('keydown', handleToolKeys, true);
     currentPath = location.pathname;
     window.addEventListener('popstate', handleNavigation);
     navPollId = window.setInterval(handleNavigation, 300);
@@ -2071,7 +2087,7 @@ export function createToolbar(): Toolbar {
     // hides the popover via onPickingChange while remembering whether it was
     // open, so it can reappear when the user next enters Select mode.
     document.removeEventListener('click', handleOutsideClick);
-    document.removeEventListener('keydown', handleFreezeKey, true);
+    document.removeEventListener('keydown', handleToolKeys, true);
     window.removeEventListener('popstate', handleNavigation);
     if (navPollId) {
       window.clearInterval(navPollId);
