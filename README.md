@@ -20,6 +20,7 @@ only touches a page while you have the extension loaded and toggled on.
 ## Features
 
 - **Toggle hotkey** — **Ctrl/Cmd+Shift+S** (or click the extension's toolbar icon) shows/hides the tool on the current tab. It is a browser-global command handled by the service worker, so it works on any tab without opening the tool first. Rebind or disable it at `chrome://extensions/shortcuts`; the **Hotkey** button in the settings popover opens that page directly.
+- **Freeze hotkey** — **Ctrl/Cmd+Shift+F** pins the hover/popover UI currently under your cursor and opens Nshot straight into **Select** mode, so transient UIs (menus, tooltips, dropdowns) that vanish on click-away can be spotlighted and captured. It force-holds the CSS `:hover` state and swallows the mouse-leave/blur events that dismiss JS-driven popovers; the freeze survives the capture (so it lands in the shot) and is released with **Esc** or by closing the tool. Also a browser-global command, rebindable at `chrome://extensions/shortcuts`. Cross-origin stylesheets can't be read, so purely cross-origin CSS hover effects may not hold.
 - **Spotlight** — in **Select** mode, click a page element to cut it out of the dim so it stays bright. The element you click becomes the **active** selection: changing the color/padding/thickness/radius then updates it live, until you select another element. **Shift+click** builds a multi-select group so a setting change hits every element in it at once. When elements picked in the **same Shift+click group touch or overlap**, they render as a single large box (one continuous cutout and one outline) instead of several small boxes with dim seams between them; picks made in separate clicks never combine, even if they touch. Click a spotlit element again (with the current settings unchanged) to remove it; if the settings differ, the click re-applies them instead.
 - **Auto dim** — there is no dim button: the page dims automatically whenever the spotlight is in use (while picking, or whenever at least one element is selected), and the dim survives into the capture.
 - **Outline** — draw an accent border around each spotlit element; pick the color from the recent-color circles or a custom color picker.
@@ -71,7 +72,8 @@ the right to exit.
   element to spotlight it (it becomes the active selection); **Shift+click** to
   spotlight several at once as a group (elements picked together in one group
   that touch merge into one large box); click a spotlit element again to remove
-  it. **Esc** stops picking.
+  it. **Esc** stops picking. **Ctrl/Cmd+Shift+F** freezes a disappearing
+  hover/popover UI and drops you here in Select mode (see **Freeze hotkey**).
 - **Undo** (left, in Select mode) — step back one change: a pick, an unpick, a
   **Clear**, or a live settings edit applied to the active selection. Each
   settings change is one step: a whole slider drag collapses into a single undo
@@ -215,6 +217,7 @@ the harness-mounted one, even with the extension loaded and the dev server open.
 | `src/content/index.ts` | Injected entry; wires the toggle message to the toolbar |
 | `src/content/ui.ts` | Toolbar + save-modal DOM (ShadowRoot) |
 | `src/content/overlay.ts` | Dim / spotlight / outline effect engine |
+| `src/content/freeze.ts` | Freeze engine: force-hold `:hover` + swallow dismissal events for the freeze hotkey |
 | `src/content/styles.ts` | ShadowRoot-scoped CSS |
 | `src/content/capture.ts` | Capture/clipboard/download message helpers |
 | `src/content/messages.ts` | Message protocol shared by content + background |

@@ -1,4 +1,4 @@
-import type { ToggleCommand } from './messages.ts';
+import type { BackgroundCommand } from './messages.ts';
 import { createToolbar } from './ui.ts';
 
 // The background worker injects this file once per tab, then sends `toggle`
@@ -15,9 +15,11 @@ if (!win.__nhostScreenshotToolReady) {
   win.__nhostScreenshotToolReady = true;
   const toolbar = createToolbar();
 
-  chrome.runtime.onMessage.addListener((message: ToggleCommand) => {
+  chrome.runtime.onMessage.addListener((message: BackgroundCommand) => {
     if (message?.type === 'toggle') {
       toolbar.toggle();
+    } else if (message?.type === 'freeze') {
+      toolbar.freeze();
     }
   });
 }

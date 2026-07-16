@@ -2,6 +2,8 @@ import type {
 	ActionResponse,
 	CaptureResponse,
 	ContentRequest,
+	FreezeCommand,
+	ToggleCommand,
 } from "./content/messages.ts";
 
 const CONTENT_SCRIPT = "content.js";
@@ -15,45 +17,53 @@ function errMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-/** Toggle the tool on a tab: inject the content script on first use, then let
- * it flip itself on/off for every subsequent press. */
-async function toggleTab(tab: chrome.tabs.Tab): Promise<void> {
+/** Deliver a command to a tab's content script, injecting it on first use
+ * (first press, or after a full page reload) then retrying. */
+async function sendToTab(
+	tab: chrome.tabs.Tab,
+	message: ToggleCommand | FreezeCommand,
+): Promise<void> {
 	const tabId = tab.id;
 	if (tabId === undefined || EXCLUDED_URL.test(tab.url ?? "")) {
 		return;
 	}
 	try {
-		await chrome.tabs.sendMessage(tabId, { type: "toggle" });
+		await chrome.tabs.sendMessage(tabId, message);
 	} catch {
-		// No content script yet (first press, or after a full page reload).
 		await chrome.scripting.executeScript({
 			target: { tabId },
 			files: [CONTENT_SCRIPT],
 		});
-		await chrome.tabs.sendMessage(tabId, { type: "toggle" });
+		await chrome.tabs.sendMessage(tabId, message);
 	}
 }
 
 chrome.action.onClicked.addListener((tab) => {
-	void toggleTab(tab);
+	void sendToTab(tab, { type: "toggle" });
 });
 
-// Browser-global keyboard shortcut (configurable at chrome://extensions/shortcuts).
-// Handled here rather than via a page-level listener so it works on every tab
-// without first opening the tool on that page.
+// Browser-global keyboard shortcuts (configurable at
+// chrome://extensions/shortcuts). Handled here rather than via a page-level
+// listener so they work on every tab without first opening the tool there.
+const COMMAND_MESSAGE: Record<string, ToggleCommand | FreezeCommand> = {
+	"toggle-tool": { type: "toggle" },
+	"freeze-ui": { type: "freeze" },
+};
+
 chrome.commands.onCommand.addListener((command, tab) => {
-	if (command !== "toggle-tool") {
+	const message = COMMAND_MESSAGE[command];
+	if (!message) {
 		return;
 	}
 	if (tab) {
-		void toggleTab(tab);
+		void sendToTab(tab, message);
 		return;
 	}
 	void chrome.tabs
 		.query({ active: true, currentWindow: true })
 		.then(([active]) => {
 			if (active) {
-				void toggleTab(active);
+				void sendToTab(active, message);
 			}
 		});
 });

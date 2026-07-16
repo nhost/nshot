@@ -21,3 +21,13 @@ export type ActionResponse =
 export interface ToggleCommand {
   type: 'toggle';
 }
+
+/** background -> content: open the tool in select mode and freeze whatever
+ * hover/popover UI is currently under the cursor, so it can be spotlighted and
+ * captured instead of vanishing on the first click-away. */
+export interface FreezeCommand {
+  type: 'freeze';
+}
+
+/** Every background -> content command. */
+export type BackgroundCommand = ToggleCommand | FreezeCommand;

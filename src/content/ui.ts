@@ -6,6 +6,7 @@ import {
   requestDownload,
   requestOpenShortcuts,
 } from './capture.ts';
+import { FreezeController } from './freeze.ts';
 import {
   DEFAULT_OPTIONS,
   OverlayController,
@@ -408,11 +409,14 @@ export interface Toolbar {
   toggle(): void;
   activate(): void;
   deactivate(): void;
+  /** Open in select mode and freeze the hover/popover UI under the cursor. */
+  freeze(): void;
   readonly active: boolean;
 }
 
 export function createToolbar(): Toolbar {
   const overlay = new OverlayController();
+  const freezeController = new FreezeController();
   const opts = { ...DEFAULT_OPTIONS };
   const storedColor = loadOutlineColor();
   if (storedColor) {
@@ -1173,7 +1177,21 @@ export function createToolbar(): Toolbar {
   rightGroup.className = 'nhost-ss-rightgroup';
   rightGroup.append(clearBtn, captureBtn);
 
-  frame.append(leftGroup, selectBtn, rightGroup, closeBtn, colorPop);
+  // A small pill under the toolbar shown only while a UI is frozen. It lives
+  // inside the frame so the capture flow's `frame.visibility = hidden` hides it
+  // from the screenshot, and is positioned absolutely so it stays out of the
+  // frame's grid layout.
+  const frozenHint = document.createElement('div');
+  frozenHint.className = 'nhost-ss-frozen-hint';
+  frozenHint.textContent =
+    '❄ Frozen — pick elements, then capture (Esc to release)';
+  frozenHint.style.cssText =
+    'position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);' +
+    'display:none;padding:4px 10px;border-radius:9999px;background:rgba(20,20,22,0.92);' +
+    'color:#fff;font:500 12px/1.4 system-ui,sans-serif;white-space:nowrap;' +
+    'pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,0.35);';
+
+  frame.append(leftGroup, selectBtn, rightGroup, closeBtn, colorPop, frozenHint);
 
   // --- Save modal (built once, shown by appending the backdrop) ---
   const backdrop = document.createElement('div');
@@ -1955,6 +1973,26 @@ export function createToolbar(): Toolbar {
     restorePersisted(currentPath);
   };
 
+  // Freeze ends itself when the user presses Esc; drop the on-screen hint to
+  // match. The overlay's own Esc handler leaves select mode in the same press.
+  freezeController.onEnd = () => {
+    frozenHint.style.display = 'none';
+  };
+
+  // Open the tool in select mode and pin whatever hover/popover UI is under the
+  // cursor, so it can be spotlighted and captured instead of vanishing when the
+  // pointer moves to the toolbar. The freeze deliberately survives capture (so
+  // it lands in the shot) and is released by Esc or closing the tool.
+  function freeze(): void {
+    if (!active) {
+      activate();
+    }
+    // Pin the current UI first, before entering select mode can disturb it.
+    freezeController.begin();
+    overlay.startPicking();
+    frozenHint.style.display = 'block';
+  }
+
   function activate(): void {
     if (active) {
       return;
@@ -2002,6 +2040,8 @@ export function createToolbar(): Toolbar {
     }
     host.remove();
     cancelRestoreRetry();
+    freezeController.end();
+    frozenHint.style.display = 'none';
     suppressSelectionSave = true;
     overlay.deactivate();
     suppressSelectionSave = false;
@@ -2019,6 +2059,7 @@ export function createToolbar(): Toolbar {
     toggle: () => (active ? deactivate() : activate()),
     activate,
     deactivate,
+    freeze,
     get active() {
       return active;
     },

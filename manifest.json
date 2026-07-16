@@ -30,6 +30,13 @@
         "mac": "Command+Shift+S"
       },
       "description": "Toggle Nshot on the current tab"
+    },
+    "freeze-ui": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+F",
+        "mac": "Command+Shift+F"
+      },
+      "description": "Freeze the hovered UI and open Nshot in select mode"
     }
   },
   "action": {
