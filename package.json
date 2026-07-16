@@ -10,9 +10,12 @@
     "dev": "node dev/serve.mjs",
     "icons": "node dev/make-icons.mjs",
     "icons:watch": "node dev/make-icons.mjs --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "format": "biome format --write .",
+    "format:check": "biome format ."
   },
   "devDependencies": {
+    "@biomejs/biome": "^2",
     "@types/chrome": "^0.0.287",
     "esbuild": "^0.25.0",
     "typescript": "5.8.3"

@@ -1191,7 +1191,14 @@ export function createToolbar(): Toolbar {
     'color:#fff;font:500 12px/1.4 system-ui,sans-serif;white-space:nowrap;' +
     'pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,0.35);';
 
-  frame.append(leftGroup, selectBtn, rightGroup, closeBtn, colorPop, frozenHint);
+  frame.append(
+    leftGroup,
+    selectBtn,
+    rightGroup,
+    closeBtn,
+    colorPop,
+    frozenHint,
+  );
 
   // --- Save modal (built once, shown by appending the backdrop) ---
   const backdrop = document.createElement('div');
