@@ -137,6 +137,88 @@ function viewRect(el: Element, padding: number): DocRect {
   };
 }
 
+// Two padded rects that touch or overlap (within a small tolerance to absorb
+// sub-pixel gaps and hairline borders between adjacent elements) are merged
+// into one box. Standard axis-aligned overlap test, slackened by `tol`.
+const MERGE_TOLERANCE = 1;
+
+function rectsTouch(a: DocRect, b: DocRect, tol: number): boolean {
+  return (
+    a.x <= b.x + b.w + tol &&
+    b.x <= a.x + a.w + tol &&
+    a.y <= b.y + b.h + tol &&
+    b.y <= a.y + a.h + tol
+  );
+}
+
+function boundingRect(rects: DocRect[]): DocRect {
+  const minX = Math.min(...rects.map((r) => r.x));
+  const minY = Math.min(...rects.map((r) => r.y));
+  const maxX = Math.max(...rects.map((r) => r.x + r.w));
+  const maxY = Math.max(...rects.map((r) => r.y + r.h));
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+// Only merge boxes that look identical (same color/thickness/radius), so a
+// combined box has one unambiguous style and visually distinct spotlights that
+// merely happen to touch stay separate.
+interface BoxStyle {
+  color: string;
+  outlineWidth: number;
+  radius: number;
+}
+
+function sameStyle(a: BoxStyle, b: BoxStyle): boolean {
+  return (
+    a.color === b.color &&
+    a.outlineWidth === b.outlineWidth &&
+    a.radius === b.radius
+  );
+}
+
+// Group spotlit elements whose padded rects touch/overlap AND share a style,
+// via union-find, so a Shift+click set of adjacent elements renders as one
+// large box instead of a row of small boxes with dim seams between them.
+// Returns arrays of indices into `rects`/`styles`; unconnected boxes come back
+// as singletons.
+function mergeTouchingGroups(styles: BoxStyle[], rects: DocRect[]): number[][] {
+  const n = rects.length;
+  const parent = Array.from({ length: n }, (_, i) => i);
+  const find = (i: number): number => {
+    let root = i;
+    while (parent[root] !== root) {
+      root = parent[root];
+    }
+    while (parent[i] !== root) {
+      const next = parent[i];
+      parent[i] = root;
+      i = next;
+    }
+    return root;
+  };
+  for (let i = 0; i < n; i += 1) {
+    for (let j = i + 1; j < n; j += 1) {
+      if (
+        sameStyle(styles[i], styles[j]) &&
+        rectsTouch(rects[i], rects[j], MERGE_TOLERANCE)
+      ) {
+        parent[find(i)] = find(j);
+      }
+    }
+  }
+  const groups = new Map<number, number[]>();
+  for (let i = 0; i < n; i += 1) {
+    const root = find(i);
+    const group = groups.get(root);
+    if (group) {
+      group.push(i);
+    } else {
+      groups.set(root, [i]);
+    }
+  }
+  return [...groups.values()];
+}
+
 export class OverlayController {
   private active = false;
   private picking = false;
@@ -695,14 +777,23 @@ export class OverlayController {
         this.picking && s.el === this.hoveredEl && this.pendingMatches(s),
     }));
 
-    // Rebuild the mask cutouts (one black rounded rect per spotlit element).
+    // Compute each spotlit element's cutout rect (document space) and outline
+    // rect (viewport space), then merge any that touch and share a style into
+    // one box, so a Shift+click set of adjacent elements renders as a single
+    // large box rather than a strip of small boxes with dim seams between them.
+    const docRects = items.map((it) => docRect(it.el, it.padding));
+    const viewRects = items.map((it) => viewRect(it.el, it.padding));
+    const groups = mergeTouchingGroups(items, docRects);
+
+    // Rebuild the mask cutouts (one black rounded rect per merged box).
     for (let i = 1; i < this.maskRects.length; i += 1) {
       this.maskRects[i].remove();
     }
     this.maskRects.length = 1;
     const maskEl = mask.parentNode as SVGMaskElement;
-    for (const { el, padding, radius } of items) {
-      const rect = docRect(el, padding);
+    for (const group of groups) {
+      const rect = boundingRect(group.map((i) => docRects[i]));
+      const { radius } = items[group[0]];
       const cut = document.createElementNS(SVG_NS, 'rect');
       cut.setAttribute('x', String(rect.x));
       cut.setAttribute('y', String(rect.y));
@@ -714,17 +805,14 @@ export class OverlayController {
       this.maskRects.push(cut);
     }
 
-    // Rebuild the outline boxes (per-element color/thickness/radius).
+    // Rebuild the outline boxes (one per merged box, in its shared style).
     outlineLayer.replaceChildren();
     if (outline) {
-      for (const {
-        el,
-        padding,
-        color,
-        outlineWidth,
-        radius,
-        removable,
-      } of items) {
+      for (const group of groups) {
+        const { color, outlineWidth, radius } = items[group[0]];
+        // A merged box hints removal if any of its members is the removable
+        // (hovered, settings-unchanged) element.
+        const removable = group.some((i) => items[i].removable);
         const transparent = isTransparent(color);
         // Transparent outlines are an on-screen-only guide; omit them from the
         // capture entirely so the screenshot stays truly outline-free.
@@ -738,7 +826,7 @@ export class OverlayController {
         if (transparent && !removable) {
           continue;
         }
-        const rect = viewRect(el, padding);
+        const rect = boundingRect(group.map((i) => viewRects[i]));
         const box = document.createElement('div');
         // Keep the spotlight bright; only switch the outline to dashed to hint
         // that a click on the hovered element will remove it.
