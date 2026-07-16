@@ -20,7 +20,7 @@ only touches a page while you have the extension loaded and toggled on.
 ## Features
 
 - **Toggle hotkey** — **Ctrl/Cmd+Shift+S** (or click the extension's toolbar icon) shows/hides the tool on the current tab. It is a browser-global command handled by the service worker, so it works on any tab without opening the tool first. Rebind or disable it at `chrome://extensions/shortcuts`; the **Hotkey** button in the settings popover opens that page directly.
-- **Spotlight** — in **Select** mode, click a page element to cut it out of the dim so it stays bright. The element you click becomes the **active** selection: changing the color/padding/thickness/radius then updates it live, until you select another element. **Shift+click** builds a multi-select group so a setting change hits every element in it at once. When spotlit boxes that share the same style **touch or overlap**, they render as a single large box (one continuous cutout and one outline) instead of several small boxes with dim seams between them. Click a spotlit element again (with the current settings unchanged) to remove it; if the settings differ, the click re-applies them instead.
+- **Spotlight** — in **Select** mode, click a page element to cut it out of the dim so it stays bright. The element you click becomes the **active** selection: changing the color/padding/thickness/radius then updates it live, until you select another element. **Shift+click** builds a multi-select group so a setting change hits every element in it at once. When elements picked in the **same Shift+click group touch or overlap**, they render as a single large box (one continuous cutout and one outline) instead of several small boxes with dim seams between them; picks made in separate clicks never combine, even if they touch. Click a spotlit element again (with the current settings unchanged) to remove it; if the settings differ, the click re-applies them instead.
 - **Auto dim** — there is no dim button: the page dims automatically whenever the spotlight is in use (while picking, or whenever at least one element is selected), and the dim survives into the capture.
 - **Outline** — draw an accent border around each spotlit element; pick the color from the recent-color circles or a custom color picker.
 - **Settings** — a popover (the color swatch button) with the color circles plus **Padding**, **Line thickness**, **Border radius**, and **Background dim** sliders. **Reset** restores the sliders to defaults; **Clear history** forgets saved spotlights, undo history, and recent colors across every page.
@@ -69,8 +69,9 @@ the right to exit.
 
 - **Select** (center) — enter/leave spotlight mode. While picking, click a page
   element to spotlight it (it becomes the active selection); **Shift+click** to
-  spotlight several at once as a group (adjacent boxes that touch merge into one
-  large box); click a spotlit element again to remove it. **Esc** stops picking.
+  spotlight several at once as a group (elements picked together in one group
+  that touch merge into one large box); click a spotlit element again to remove
+  it. **Esc** stops picking.
 - **Undo** (left, in Select mode) — step back one change: a pick, an unpick, a
   **Clear**, or a live settings edit applied to the active selection. Each
   settings change is one step: a whole slider drag collapses into a single undo

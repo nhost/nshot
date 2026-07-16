@@ -196,6 +196,7 @@ interface StoredSelection {
   p: number;
   w: number;
   r: number;
+  g: number;
 }
 
 function toStored(entries: SelectionEntry[]): StoredSelection[] {
@@ -203,7 +204,14 @@ function toStored(entries: SelectionEntry[]): StoredSelection[] {
     .map((e): StoredSelection | null => {
       const s = uniqueSelector(e.el);
       return s
-        ? { s, c: e.color, p: e.padding, w: e.outlineWidth, r: e.radius }
+        ? {
+            s,
+            c: e.color,
+            p: e.padding,
+            w: e.outlineWidth,
+            r: e.radius,
+            g: e.group,
+          }
         : null;
     })
     .filter((x): x is StoredSelection => x !== null);
@@ -216,11 +224,15 @@ function resolveStored(items: unknown): SelectionEntry[] {
     return [];
   }
   const entries: SelectionEntry[] = [];
+  // Entries persisted before groups existed have no `g`; give each its own
+  // fallback id (distinct, negative so it never collides with a live-allocated
+  // group) so old picks stay separate rather than merging on restore.
+  let fallbackGroup = 0;
   for (const item of items) {
     if (typeof item !== 'object' || item === null) {
       continue;
     }
-    const { s, c, p, w, r } = item as Record<string, unknown>;
+    const { s, c, p, w, r, g } = item as Record<string, unknown>;
     if (typeof s !== 'string') {
       continue;
     }
@@ -236,10 +248,17 @@ function resolveStored(items: unknown): SelectionEntry[] {
         : DEFAULT_OPTIONS.outlineWidth;
     const radius =
       typeof r === 'number' && Number.isFinite(r) ? r : DEFAULT_OPTIONS.radius;
+    let group: number;
+    if (typeof g === 'number' && Number.isFinite(g)) {
+      group = g;
+    } else {
+      fallbackGroup -= 1;
+      group = fallbackGroup;
+    }
     try {
       const el = document.querySelector(s);
       if (el) {
-        entries.push({ el, color, padding, outlineWidth, radius });
+        entries.push({ el, color, padding, outlineWidth, radius, group });
       }
     } catch {
       // Ignore selectors that no longer parse or resolve on this page.

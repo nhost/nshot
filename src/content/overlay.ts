@@ -109,6 +109,10 @@ export interface SelectionEntry {
   padding: number;
   outlineWidth: number;
   radius: number;
+  /** Identifies the Shift+click moment this pick belongs to. Picks made in the
+   * same additive gesture share a group id; a plain click starts a fresh one.
+   * Only boxes in the same group ever merge into one large box. */
+  group: number;
 }
 
 function docRect(el: Element, padding: number): DocRect {
@@ -159,29 +163,36 @@ function boundingRect(rects: DocRect[]): DocRect {
   return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
 
-// Only merge boxes that look identical (same color/thickness/radius), so a
-// combined box has one unambiguous style and visually distinct spotlights that
-// merely happen to touch stay separate.
-interface BoxStyle {
+// A merge candidate: the shift+click group a box belongs to plus its visual
+// style. Boxes only combine when they were selected in the same Shift+click
+// moment (same `group`) AND look identical, so separately-clicked picks that
+// merely happen to touch never combine, and a combined box has one
+// unambiguous style.
+interface MergeCandidate {
+  group: number;
   color: string;
   outlineWidth: number;
   radius: number;
 }
 
-function sameStyle(a: BoxStyle, b: BoxStyle): boolean {
+function canMerge(a: MergeCandidate, b: MergeCandidate): boolean {
   return (
+    a.group === b.group &&
     a.color === b.color &&
     a.outlineWidth === b.outlineWidth &&
     a.radius === b.radius
   );
 }
 
-// Group spotlit elements whose padded rects touch/overlap AND share a style,
-// via union-find, so a Shift+click set of adjacent elements renders as one
-// large box instead of a row of small boxes with dim seams between them.
-// Returns arrays of indices into `rects`/`styles`; unconnected boxes come back
-// as singletons.
-function mergeTouchingGroups(styles: BoxStyle[], rects: DocRect[]): number[][] {
+// Group spotlit elements whose padded rects touch/overlap AND belong to the
+// same Shift+click group with the same style, via union-find, so an adjacent
+// set selected together renders as one large box instead of a row of small
+// boxes with dim seams between them. Returns arrays of indices into
+// `rects`/`candidates`; everything else comes back as singletons.
+function mergeTouchingGroups(
+  candidates: readonly MergeCandidate[],
+  rects: DocRect[],
+): number[][] {
   const n = rects.length;
   const parent = Array.from({ length: n }, (_, i) => i);
   const find = (i: number): number => {
@@ -199,7 +210,7 @@ function mergeTouchingGroups(styles: BoxStyle[], rects: DocRect[]): number[][] {
   for (let i = 0; i < n; i += 1) {
     for (let j = i + 1; j < n; j += 1) {
       if (
-        sameStyle(styles[i], styles[j]) &&
+        canMerge(candidates[i], candidates[j]) &&
         rectsTouch(rects[i], rects[j], MERGE_TOLERANCE)
       ) {
         parent[find(i)] = find(j);
@@ -231,6 +242,12 @@ export class OverlayController {
   // (`applyToActive`) flow only to these, leaving every other spotlit element
   // frozen at the values it was picked with. Not persisted; resets on reload.
   private activeEls: Element[] = [];
+  // The Shift+click group that further additive clicks extend, and a running
+  // id source. A plain click allocates a fresh group; Shift+click reuses the
+  // active one. Boxes only merge within a group, so picks from separate click
+  // moments never combine even when they touch.
+  private activeGroupId: number | null = null;
+  private nextGroupId = 1;
   // Snapshots of `selected` taken before each selection-changing action, so the
   // toolbar's Undo can step back one pick/unpick/clear at a time.
   private readonly history: SelectionEntry[][] = [];
@@ -296,6 +313,8 @@ export class OverlayController {
     this.maskRects = [];
     this.selected.length = 0;
     this.activeEls = [];
+    this.activeGroupId = null;
+    this.nextGroupId = 1;
     this.history.length = 0;
     this.active = false;
     this.onSelectionChange(0);
@@ -350,6 +369,7 @@ export class OverlayController {
     this.pushHistory();
     this.selected.length = 0;
     this.activeEls = [];
+    this.activeGroupId = null;
     this.render();
     this.onSelectionChange(0);
   }
@@ -360,6 +380,7 @@ export class OverlayController {
   clearAll(): void {
     this.selected.length = 0;
     this.activeEls = [];
+    this.activeGroupId = null;
     this.history.length = 0;
     this.render();
     this.onSelectionChange(0);
@@ -391,6 +412,7 @@ export class OverlayController {
     this.selected.length = 0;
     this.selected.push(...prev);
     this.activeEls = [];
+    this.activeGroupId = null;
     this.render();
     this.onSelectionChange(this.selected.length);
   }
@@ -418,6 +440,19 @@ export class OverlayController {
       }
     }
     this.activeEls = [];
+    this.activeGroupId = null;
+    // Ensure freshly-allocated group ids never collide with restored ones
+    // (spanning both the live selection and every history snapshot).
+    let maxGroup = 0;
+    for (const s of this.selected) {
+      maxGroup = Math.max(maxGroup, s.group);
+    }
+    for (const snap of this.history) {
+      for (const s of snap) {
+        maxGroup = Math.max(maxGroup, s.group);
+      }
+    }
+    this.nextGroupId = Math.max(this.nextGroupId, maxGroup + 1);
     this.render();
     this.onSelectionChange(this.selected.length);
   }
@@ -653,11 +688,19 @@ export class OverlayController {
         removed = true;
       } else {
         // Settings changed since this element was picked: re-apply them in place
-        // (an undoable step) rather than removing the spotlight.
-        this.selected[index] = { el, ...pending };
+        // (an undoable step) rather than removing the spotlight. Keep it in its
+        // original Shift+click group so its merge behavior is unchanged.
+        this.selected[index] = { el, group: cur.group, ...pending };
       }
     } else {
-      this.selected.push({ el, ...pending });
+      // A Shift+click joins the active group; a plain click (or a Shift+click
+      // with nothing active) starts a fresh one. Boxes only merge within a
+      // group, so picks from separate click moments never combine.
+      const group =
+        additive && this.activeGroupId !== null
+          ? this.activeGroupId
+          : this.nextGroupId++;
+      this.selected.push({ el, group, ...pending });
     }
     // Maintain the active editing set. Shift+click extends the current group;
     // a plain click restarts it at just this element (or empties it on remove).
@@ -674,6 +717,12 @@ export class OverlayController {
     this.activeEls = this.activeEls.filter((a) =>
       this.selected.some((s) => s.el === a),
     );
+    // Track the group that future Shift+clicks should extend: the group of
+    // whatever is now active, or none when the active set is empty.
+    this.activeGroupId =
+      this.activeEls.length > 0
+        ? (this.selected.find((s) => s.el === this.activeEls[0])?.group ?? null)
+        : null;
     this.render();
     // Flip the cursor element's indicator immediately on (un)select instead of
     // waiting for the next mouse move.
@@ -773,6 +822,7 @@ export class OverlayController {
       color: s.color,
       outlineWidth: s.outlineWidth,
       radius: s.radius,
+      group: s.group,
       removable:
         this.picking && s.el === this.hoveredEl && this.pendingMatches(s),
     }));
