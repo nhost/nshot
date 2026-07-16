@@ -51,6 +51,40 @@ export const FRAME_STYLES = `
   cursor: default;
 }
 
+/* Freeze mode: a frost-accent ring on the toolbar plus a labelled badge just
+ * below it, so it is unmistakable that a hover/popover UI is pinned in place. */
+.nhost-ss-frame.is-frozen {
+  box-shadow:
+    0 0 0 2px rgba(56, 189, 248, 0.9),
+    0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.nhost-ss-frozen-hint {
+  position: fixed;
+  top: 52px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483601;
+  display: none;
+  align-items: center;
+  padding: 5px 12px;
+  border-radius: 9999px;
+  background: rgba(8, 47, 73, 0.94);
+  border: 1px solid rgba(56, 189, 248, 0.9);
+  color: #e0f2fe;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  animation: nhost-ss-pop-in 0.16s ease-out;
+}
+
+.nhost-ss-frozen-hint.is-on {
+  display: flex;
+}
+
 /* Select (center) + Clear (right cap) form one black, rounded pill. The left
  * group is its OWN rounded island, separated from Select by a gap so its
  * rightmost button's hover/active highlight has room and isn't clipped. */

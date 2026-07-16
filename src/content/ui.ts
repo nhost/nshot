@@ -1184,12 +1184,7 @@ export function createToolbar(): Toolbar {
   const frozenHint = document.createElement('div');
   frozenHint.className = 'nhost-ss-frozen-hint';
   frozenHint.textContent =
-    '❄ Frozen — pick elements, then capture (Esc to release)';
-  frozenHint.style.cssText =
-    'position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);' +
-    'display:none;padding:4px 10px;border-radius:9999px;background:rgba(20,20,22,0.92);' +
-    'color:#fff;font:500 12px/1.4 system-ui,sans-serif;white-space:nowrap;' +
-    'pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,0.35);';
+    '❄ Frozen — click the UI to spotlight, then Capture · Esc to release';
 
   frame.append(
     leftGroup,
@@ -1902,6 +1897,23 @@ export function createToolbar(): Toolbar {
     }
   };
 
+  // In-page fallback for the freeze shortcut. The browser-global `freeze-ui`
+  // command only fires once its key is bound at chrome://extensions/shortcuts —
+  // Chrome doesn't auto-bind commands added to an already-installed extension —
+  // so while the toolbar is open we also watch for Ctrl/Cmd+Shift+F ourselves,
+  // making freeze work out of the box. If the command IS bound the browser
+  // intercepts the chord before the page sees it, so there is no double-fire.
+  const handleFreezeKey = (event: KeyboardEvent) => {
+    if (
+      event.code === 'KeyF' &&
+      event.shiftKey &&
+      (event.metaKey || event.ctrlKey)
+    ) {
+      event.preventDefault();
+      freeze();
+    }
+  };
+
   // --- Wiring: modal ---
   modalClose.addEventListener('click', closeModal);
   // Only dismiss when the press both starts and ends on the backdrop itself. A
@@ -1983,7 +1995,8 @@ export function createToolbar(): Toolbar {
   // Freeze ends itself when the user presses Esc; drop the on-screen hint to
   // match. The overlay's own Esc handler leaves select mode in the same press.
   freezeController.onEnd = () => {
-    frozenHint.style.display = 'none';
+    frame.classList.remove('is-frozen');
+    frozenHint.classList.remove('is-on');
   };
 
   // Open the tool in select mode and pin whatever hover/popover UI is under the
@@ -1997,7 +2010,8 @@ export function createToolbar(): Toolbar {
     // Pin the current UI first, before entering select mode can disturb it.
     freezeController.begin();
     overlay.startPicking();
-    frozenHint.style.display = 'block';
+    frame.classList.add('is-frozen');
+    frozenHint.classList.add('is-on');
   }
 
   function activate(): void {
@@ -2009,6 +2023,7 @@ export function createToolbar(): Toolbar {
 
     document.documentElement.appendChild(host);
     document.addEventListener('click', handleOutsideClick);
+    document.addEventListener('keydown', handleFreezeKey, true);
     currentPath = location.pathname;
     window.addEventListener('popstate', handleNavigation);
     navPollId = window.setInterval(handleNavigation, 300);
@@ -2040,6 +2055,7 @@ export function createToolbar(): Toolbar {
     // hides the popover via onPickingChange while remembering whether it was
     // open, so it can reappear when the user next enters Select mode.
     document.removeEventListener('click', handleOutsideClick);
+    document.removeEventListener('keydown', handleFreezeKey, true);
     window.removeEventListener('popstate', handleNavigation);
     if (navPollId) {
       window.clearInterval(navPollId);
@@ -2048,7 +2064,8 @@ export function createToolbar(): Toolbar {
     host.remove();
     cancelRestoreRetry();
     freezeController.end();
-    frozenHint.style.display = 'none';
+    frame.classList.remove('is-frozen');
+    frozenHint.classList.remove('is-on');
     suppressSelectionSave = true;
     overlay.deactivate();
     suppressSelectionSave = false;
